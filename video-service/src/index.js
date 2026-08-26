@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { generateVideo } from './pipeline/buildVideo.js';
 import { selectStyle } from './pipeline/selectStyle.js';
+import { ensureSeAssets } from './pipeline/ensureSe.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
@@ -42,6 +43,15 @@ app.post('/generate', upload.array('photos', 20), async (req, res) => {
 });
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`video-service listening on :${PORT}`);
-});
+ensureSeAssets()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`video-service listening on :${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('[ensureSeAssets] SE合成に失敗、無音のまま起動します:', err.message ?? err);
+    app.listen(PORT, () => {
+      console.log(`video-service listening on :${PORT}`);
+    });
+  });
