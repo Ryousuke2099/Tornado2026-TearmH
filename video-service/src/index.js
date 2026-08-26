@@ -10,6 +10,7 @@ import { generateVideo } from './pipeline/buildVideo.js';
 import { selectStyle } from './pipeline/selectStyle.js';
 import { ensureSeAssets } from './pipeline/ensureSe.js';
 import { resolveShotImagePaths } from './pipeline/planShots.js';
+import { resizePhotosInPlace } from './pipeline/resizePhotos.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
@@ -39,6 +40,8 @@ app.post('/generate', upload.array('photos', 20), async (req, res) => {
   const photoPaths = req.files.map((f) => f.path);
 
   try {
+    // 高解像度のスマホ写真をそのまま扱うとOOMの原因になるため、先に上限サイズへ縮小する。
+    await resizePhotosInPlace(photoPaths);
     // 「どの写真をどのショットに使うか」を先に決めてから、AIにショットごとの演出を判断させる。
     // AIはFFmpegに渡すスタイルパラメータ(JSON)を選ぶだけで、動画そのものは生成しない。
     const shotImagePaths = resolveShotImagePaths(photoPaths);
