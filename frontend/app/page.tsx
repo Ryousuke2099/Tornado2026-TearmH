@@ -7,6 +7,7 @@ const VIDEO_SERVICE_URL =
 
 type ShotStyle = {
   focus_bias: string;
+  motion: string;
   pan_direction: string;
   zoom_intensity: string;
   color_grade: string;
@@ -19,6 +20,7 @@ type Style = {
   music_mood: string;
   reasoning: string;
   ai_used: boolean;
+  ai_provider?: string;
   shots: ShotStyle[];
 };
 
@@ -122,7 +124,7 @@ export default function Home() {
         {style && (
           <div className="rounded-lg border border-zinc-200 bg-white p-4 text-sm dark:border-zinc-800 dark:bg-zinc-900">
             <p className="font-medium text-zinc-950 dark:text-zinc-50">
-              {style.ai_used ? "AIが選んだスタイル" : "デフォルトスタイル(AI未使用)"}
+              {style.ai_used ? `AIが選んだスタイル(${style.ai_provider ?? "AI"})` : "デフォルトスタイル(AI未使用)"}
             </p>
             <p className="mt-1 text-zinc-600 dark:text-zinc-400">{style.reasoning}</p>
             <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-zinc-600 dark:text-zinc-400">
@@ -140,8 +142,8 @@ export default function Home() {
                   key={i}
                   className="rounded border border-zinc-200 p-2 text-xs text-zinc-600 dark:border-zinc-800 dark:text-zinc-400"
                 >
-                  #{i + 1}: {shot.focus_bias} / パン{shot.pan_direction} / ズーム{shot.zoom_intensity} /{" "}
-                  {shot.color_grade} / ヴィネット{shot.vignette ? "あり" : "なし"}
+                  #{i + 1}: {shot.motion} / {shot.focus_bias} / パン{shot.pan_direction} / ズーム
+                  {shot.zoom_intensity} / {shot.color_grade} / ヴィネット{shot.vignette ? "あり" : "なし"}
                   {i > 0 && ` / トランジション${shot.transition_in}`}
                 </li>
               ))}

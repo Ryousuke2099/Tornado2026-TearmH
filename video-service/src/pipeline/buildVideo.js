@@ -40,6 +40,28 @@ const COLOR_GRADE_FILTERS = {
   monochrome: 'hue=s=0',
 };
 
+// 演出の「動きの種類」。以前は全ショット固定でzoompanのズームインしかしていなかったが、
+// 「演出をズームに固定するな」との指摘を受けて4種類に分けた。
+// - zoom_in: 従来通りズームインしながらパン
+// - zoom_out: ズームアウト(最初から寄っていて引いていく)。zoompanの'zoom'変数はon(フレーム番号)が
+//   0のときだけ明示的にtarget値を返し、以降はそこから減算する式にすることで実現している
+//   (reverseフィルタで映像を逆再生する案もあるが、フレームをすべてメモリに溜め込む必要があり
+//   Renderの512MBプランでOOMを起こしたばかりなので採用しなかった)
+// - static: 完全に静止(zoompan自体を使わない)。動きの無いカットも混ぜて緩急をつける
+// - pan_only: ズームは固定倍率のまま変化させず、パンだけで動きを出す
+const MOTION_TYPES = ['zoom_in', 'zoom_out', 'static', 'pan_only'];
+
+function buildZoomExpr(motion, zoom) {
+  if (motion === 'zoom_out') {
+    return `if(eq(on,0),${zoom.target},max(zoom-${zoom.rate},1.0))`;
+  }
+  if (motion === 'pan_only') {
+    return `${zoom.target}`;
+  }
+  // zoom_in(デフォルト)
+  return `min(zoom+${zoom.rate},${zoom.target})`;
+}
+
 // パン方向。ズームインしながらon(出力フレーム番号)/framesの進行に応じて微小に動かす。
 const PAN_DRIFT = {
   'up-left': { dx: -1, dy: -1 },
@@ -71,29 +93,41 @@ function buildVideoFilterGraph(shotImagePaths, shotStyles, tempo) {
     const cropFilter = crop ? `crop=iw*${crop.w}:ih*${crop.h}:iw*${crop.x}:ih*${crop.y},` : '';
     const zoom = ZOOM_PARAMS[shotStyle.zoom_intensity] ?? ZOOM_PARAMS.moderate;
     const colorFilter = COLOR_GRADE_FILTERS[shotStyle.color_grade] ?? COLOR_GRADE_FILTERS.vivid;
-    const pan = PAN_DRIFT[shotStyle.pan_direction] ?? PAN_DRIFT.none;
+    const motion = MOTION_TYPES.includes(shotStyle.motion) ? shotStyle.motion : 'zoom_in';
     const vignetteFilter = shotStyle.vignette ? ',vignette' : '';
 
+    const basePrefix =
+      `[${i}:v]${cropFilter}scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,` +
+      `crop=${WIDTH}:${HEIGHT},setsar=1,${colorFilter}${vignetteFilter}`;
+
+    // zoompanのfpsオプションだけでは、ffmpegのビルドによって出力ストリームに
+    // 「一定フレームレート」の情報がうまく伝わらず、後段のxfadeが
+    // "inputs needs to be a constant frame rate; current rate of 1/0 is invalid"
+    // で失敗することがある(ローカルのffmpeg 6.1では問題なかったが、Renderにデプロイした
+    // ffmpeg-staticのLinuxバイナリで発生)。fpsフィルタを明示的に挟んで固定する。
+    const tail = `setpts=PTS-STARTPTS,fps=${FPS}[v${i}]`;
+
+    if (motion === 'static') {
+      // 動きなし。zoompan自体を使わず、同じ画像をそのままframes分並べるだけ。
+      return `${basePrefix},trim=start_frame=0:end_frame=${frames},${tail}`;
+    }
+
+    const pan = motion === 'pan_only' ? (PAN_DRIFT[shotStyle.pan_direction] ?? PAN_DRIFT.none) : PAN_DRIFT[shotStyle.pan_direction] ?? PAN_DRIFT.none;
     const xExpr = `iw/2-(iw/zoom/2)+${pan.dx}*${PAN_DRIFT_PX}*(on/${frames})`;
     const yExpr = `ih/2-(ih/zoom/2)+${pan.dy}*${PAN_DRIFT_PX}*(on/${frames})`;
+    const zoomExpr = buildZoomExpr(motion, zoom);
 
     return (
-      `[${i}:v]${cropFilter}scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,` +
-      `crop=${WIDTH}:${HEIGHT},setsar=1,${colorFilter}${vignetteFilter},` +
+      `${basePrefix},` +
       // zoompanは「1つの入力フレームからd枚の出力フレームを生成し、その間だけzoom値を積み上げる」
       // 仕組みなので、d=framesにしてショットの全フレームを1回の入力フレームから作らせる必要がある
       // (d=1だと出力1枚ごとに新しい入力フレーム扱いになりzoomの積み上げが毎回リセットされ、
       // 見た目上ズームが一切動かないバグになる)。入力側は-loop 1のみで無限に同じ画像を供給できるが、
       // d=framesにしたことで実際に消費されるのは最初の1フレームだけなので、以前あった
       // 「d×入力フレーム数の掛け算で動画が63倍に伸びる」問題は起きない。trimは念のための安全弁。
-      `zoompan=z='min(zoom+${zoom.rate},${zoom.target})':x='${xExpr}':y='${yExpr}':` +
+      `zoompan=z='${zoomExpr}':x='${xExpr}':y='${yExpr}':` +
       `d=${frames}:s=${WIDTH}x${HEIGHT}:fps=${FPS},` +
-      // zoompanのfpsオプションだけでは、ffmpegのビルドによって出力ストリームに
-      // 「一定フレームレート」の情報がうまく伝わらず、後段のxfadeが
-      // "inputs needs to be a constant frame rate; current rate of 1/0 is invalid"
-      // で失敗することがある(ローカルのffmpeg 6.1では問題なかったが、Renderにデプロイした
-      // ffmpeg-staticのLinuxバイナリで発生)。fpsフィルタを明示的に挟んで固定する。
-      `trim=start_frame=0:end_frame=${frames},setpts=PTS-STARTPTS,fps=${FPS}[v${i}]`
+      `trim=start_frame=0:end_frame=${frames},${tail}`
     );
   });
 

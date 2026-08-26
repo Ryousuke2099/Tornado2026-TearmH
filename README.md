@@ -26,8 +26,9 @@ cd ../frontend && npm install
 
 `ffmpeg-static` がバイナリを同梱するため、システムに別途 ffmpeg をインストールする必要はない。
 
-`video-service/.env.example` を `video-service/.env` にコピーし、`ANTHROPIC_API_KEY` を設定するとAIによる
-スタイル選定が有効になる。未設定でも動画生成自体は失敗せず、固定のデフォルトスタイルにフォールバックする。
+`video-service/.env.example` を `video-service/.env` にコピーし、`GEMINI_API_KEY`(無料枠あり、優先)または
+`ANTHROPIC_API_KEY` を設定するとAIによるスタイル選定が有効になる(`GEMINI_API_KEY`→`ANTHROPIC_API_KEY`の順で
+使う)。どちらも未設定でも動画生成自体は失敗せず、固定のデフォルトスタイルにフォールバックする。
 
 ## 起動
 
