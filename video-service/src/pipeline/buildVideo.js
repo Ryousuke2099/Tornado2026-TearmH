@@ -94,10 +94,13 @@ function buildFilterGraph(shots, style) {
     return (
       `[${i}:v]${cropFilter}scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,` +
       `crop=${WIDTH}:${HEIGHT},setsar=1,${colorFilter},` +
-      // d=1でzoompanの入力:出力フレームを1:1にし、無限ループ入力をtrimで狙った長さに切る。
-      // (以前はd=framesにした上でtrimなしで入力側もframes分ループさせていたため、
-      // zoompanのd(フレーム保持数)と入力フレーム数が掛け算されて動画が63倍近く長くなるバグがあった)
-      `zoompan=z='min(zoom+${zoom.rate},${zoom.target})':d=1:s=${WIDTH}x${HEIGHT}:fps=${FPS},` +
+      // zoompanは「1つの入力フレームからd枚の出力フレームを生成し、その間だけzoom値を積み上げる」
+      // 仕組みなので、d=framesにしてショットの全フレームを1回の入力フレームから作らせる必要がある
+      // (d=1だと出力1枚ごとに新しい入力フレーム扱いになりzoomの積み上げが毎回リセットされ、
+      // 見た目上ズームが一切動かないバグになる)。入力側は-loop 1のみで無限に同じ画像を供給できるが、
+      // d=framesにしたことで実際に消費されるのは最初の1フレームだけなので、以前あった
+      // 「d×入力フレーム数の掛け算で動画が63倍に伸びる」問題は起きない。trimは念のための安全弁。
+      `zoompan=z='min(zoom+${zoom.rate},${zoom.target})':d=${frames}:s=${WIDTH}x${HEIGHT}:fps=${FPS},` +
       `trim=start_frame=0:end_frame=${frames},setpts=PTS-STARTPTS[v${i}]`
     );
   });
