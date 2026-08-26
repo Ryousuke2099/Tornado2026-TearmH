@@ -11,8 +11,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SE_DIR = path.join(__dirname, '..', '..', 'assets', 'se');
 
 const FPS = 25;
-const WIDTH = 1080;
-const HEIGHT = 1920;
+// Renderの無料プラン(RAM 512MB)でOOM Kill(exit 137)が発生したため、1080x1920から解像度を
+// 落として負荷を下げている。ハッカソンのプロトタイプ検証用途では画質より安定動作を優先。
+const WIDTH = 720;
+const HEIGHT = 1280;
 
 // AIの役割は「どの型を使うか(ショットごと)」の判断のみ。実際の値はここでFFmpeg側が用意する
 // (video-pipeline-tech-stack.mdの「AIとFFmpegの役割分担」案)。テンポ(=尺)だけは全ショット共通の
@@ -224,6 +226,9 @@ export function generateVideo({ shotImagePaths, outPath, styleResult }) {
       '-map', '[outv]',
       ...(audioPlan ? ['-map', '[outa]'] : []),
       '-c:v', 'libx264',
+      // Renderの無料プラン(RAM 512MB)向けにメモリ・CPU負荷を下げる設定
+      '-preset', 'veryfast',
+      '-threads', '1',
       '-pix_fmt', 'yuv420p',
       // moovアトムを先頭に置き、ブラウザでのプログレッシブ再生を可能にする
       '-movflags', '+faststart',
