@@ -46,13 +46,14 @@ function buildShotItemSchema() {
       zoom_intensity: { type: 'string', enum: ZOOM_INTENSITIES, description: 'ズームの強さ(motionがstaticの場合は無視される)' },
       color_grade: { type: 'string', enum: COLOR_GRADES, description: 'この写真に合う色味' },
       vignette: { type: 'boolean', description: '画面周辺を暗くする映画的な効果を入れるか' },
+      grain: { type: 'boolean', description: 'フィルムグレイン(粒状ノイズ)を乗せてシネマティックな質感を出すか' },
       transition_in: {
         type: 'string',
         enum: TRANSITIONS,
         description: '前のショットからこのショットへ切り替わる時のトランジション種類(最初のショットでは無視される)',
       },
     },
-    required: ['focus_bias', 'motion', 'pan_direction', 'zoom_intensity', 'color_grade', 'vignette', 'transition_in'],
+    required: ['focus_bias', 'motion', 'pan_direction', 'zoom_intensity', 'color_grade', 'vignette', 'grain', 'transition_in'],
   };
 }
 
@@ -63,6 +64,14 @@ function buildStyleSchema(shotCount) {
       tempo: { type: 'string', enum: TEMPOS, description: 'カット切り替えの速さ(動画全体で共通)。落ち着いた1日ならslow、賑やかな1日ならfast' },
       music_mood: { type: 'string', enum: MUSIC_MOODS, description: '合わせるSE(効果音)の雰囲気(動画全体で共通)' },
       reasoning: { type: 'string', description: '全体の判断理由を日本語1〜2文で(ユーザーに見せる用)' },
+      catchphrase_shown: {
+        type: 'boolean',
+        description: '動画の冒頭にキャッチコピーの文字を重ねるかどうか。写真の雰囲気に合う場合のみtrue',
+      },
+      catchphrase_text: {
+        type: 'string',
+        description: '冒頭に表示する日本語のキャッチコピー。14文字以内の短い1行。catchphrase_shownがfalseなら空文字でよい',
+      },
       shots: {
         type: 'array',
         minItems: shotCount,
@@ -71,7 +80,7 @@ function buildStyleSchema(shotCount) {
         items: buildShotItemSchema(),
       },
     },
-    required: ['tempo', 'music_mood', 'reasoning', 'shots'],
+    required: ['tempo', 'music_mood', 'reasoning', 'catchphrase_shown', 'catchphrase_text', 'shots'],
   };
 }
 
@@ -87,6 +96,7 @@ function defaultShotStyle(i) {
     zoom_intensity: 'moderate',
     color_grade: 'vivid',
     vignette: false,
+    grain: i % 2 === 0,
     transition_in: transition,
   };
 }
@@ -96,6 +106,8 @@ export function buildDefaultStyle(shotCount) {
     tempo: 'medium',
     music_mood: 'nostalgic',
     reasoning: '(AI未使用のデフォルト設定)',
+    catchphrase_shown: false,
+    catchphrase_text: '',
     ai_used: false,
     shots: Array.from({ length: shotCount }, (_, i) => defaultShotStyle(i)),
   };
@@ -119,15 +131,24 @@ function toGeminiImagePart(filePath) {
 }
 
 function buildPromptText(shotCount, isSinglePhotoFallback) {
-  return isSinglePhotoFallback
-    ? `これは交換日記アプリのための写真です。写真が1枚しかないため、同じ写真を${shotCount}個の異なる` +
-      'クロップ・演出でショットとして使い、疑似的に複数カットの予告編風動画にします。' +
-      `shotsには順番に${shotCount}件、それぞれ違うfocus_bias/motion/pan_direction/zoom_intensity/color_gradeの` +
-      '組み合わせを選び、単調にならないようにしてください(1件目はtransition_inを無視して構いません)。'
-    : 'これは交換日記アプリのために、ある人が今日撮った写真です。写真は時系列の順番で並んでいます。' +
-      `shotsには写真の順番通りに${shotCount}件返してください。それぞれの写真の内容・雰囲気・` +
-      '被写体(人物中心か景色中心か)に合わせて、ショットごとに違う演出を判断してください' +
-      '(全ショット同じ組み合わせにならないよう変化をつけてください。1件目のtransition_inは無視されます)。';
+  const catchphraseNote =
+    '動画冒頭に短い日本語キャッチコピーを重ねるかどうかも判断してください。' +
+    '写真の雰囲気に合う一言が思いつく場合だけcatchphrase_shownをtrueにし、' +
+    '14文字以内の短い1行をcatchphrase_textに入れてください。無理に付けなくてよく、' +
+    '合わないと感じたらcatchphrase_shownはfalse、catchphrase_textは空文字にしてください。';
+
+  return (
+    (isSinglePhotoFallback
+      ? `これは交換日記アプリのための写真です。写真が1枚しかないため、同じ写真を${shotCount}個の異なる` +
+        'クロップ・演出でショットとして使い、疑似的に複数カットの予告編風動画にします。' +
+        `shotsには順番に${shotCount}件、それぞれ違うfocus_bias/motion/pan_direction/zoom_intensity/color_gradeの` +
+        '組み合わせを選び、単調にならないようにしてください(1件目はtransition_inを無視して構いません)。'
+      : 'これは交換日記アプリのために、ある人が今日撮った写真です。写真は時系列の順番で並んでいます。' +
+        `shotsには写真の順番通りに${shotCount}件返してください。それぞれの写真の内容・雰囲気・` +
+        '被写体(人物中心か景色中心か)に合わせて、ショットごとに違う演出を判断してください' +
+        '(全ショット同じ組み合わせにならないよう変化をつけてください。1件目のtransition_inは無視されます)。') +
+    catchphraseNote
+  );
 }
 
 function validateShots(shots, shotCount) {

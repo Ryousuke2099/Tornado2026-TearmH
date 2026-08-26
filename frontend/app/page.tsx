@@ -12,6 +12,7 @@ type ShotStyle = {
   zoom_intensity: string;
   color_grade: string;
   vignette: boolean;
+  grain: boolean;
   transition_in: string;
 };
 
@@ -21,6 +22,8 @@ type Style = {
   reasoning: string;
   ai_used: boolean;
   ai_provider?: string;
+  catchphrase_shown: boolean;
+  catchphrase_text: string;
   shots: ShotStyle[];
 };
 
@@ -127,6 +130,11 @@ export default function Home() {
               {style.ai_used ? `AIが選んだスタイル(${style.ai_provider ?? "AI"})` : "デフォルトスタイル(AI未使用)"}
             </p>
             <p className="mt-1 text-zinc-600 dark:text-zinc-400">{style.reasoning}</p>
+            {style.catchphrase_shown && style.catchphrase_text && (
+              <p className="mt-2 text-base font-semibold text-zinc-950 dark:text-zinc-50">
+                「{style.catchphrase_text}」
+              </p>
+            )}
             <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-zinc-600 dark:text-zinc-400">
               <dt>テンポ</dt>
               <dd>{style.tempo}</dd>
@@ -143,7 +151,8 @@ export default function Home() {
                   className="rounded border border-zinc-200 p-2 text-xs text-zinc-600 dark:border-zinc-800 dark:text-zinc-400"
                 >
                   #{i + 1}: {shot.motion} / {shot.focus_bias} / パン{shot.pan_direction} / ズーム
-                  {shot.zoom_intensity} / {shot.color_grade} / ヴィネット{shot.vignette ? "あり" : "なし"}
+                  {shot.zoom_intensity} / {shot.color_grade} / ヴィネット{shot.vignette ? "あり" : "なし"} /
+                  グレイン{shot.grain ? "あり" : "なし"}
                   {i > 0 && ` / トランジション${shot.transition_in}`}
                 </li>
               ))}

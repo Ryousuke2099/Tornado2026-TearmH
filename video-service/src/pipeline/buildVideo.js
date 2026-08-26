@@ -1,6 +1,6 @@
 import ffmpegPath from 'ffmpeg-static';
 import ffmpeg from 'fluent-ffmpeg';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveHitSePath } from './ensureSe.js';
@@ -9,6 +9,13 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SE_DIR = path.join(__dirname, '..', '..', 'assets', 'se');
+const FONT_PATH = path.join(__dirname, '..', '..', 'assets', 'fonts', 'NotoSansJP.ttf');
+
+// FFmpegのフィルタグラフでは`\`と`:`が特殊文字になるため、Windowsの絶対パス
+// (例: C:\Users\...)をfontfile=/textfile=にそのまま渡すと壊れる。エスケープする。
+function escapeFilterPath(filePath) {
+  return filePath.replace(/\\/g, '/').replace(/:/g, '\\:');
+}
 
 const FPS = 25;
 // Renderの無料プラン(RAM 512MB)でOOM Kill(exit 137)が発生したため、1080x1920から解像度を
@@ -95,10 +102,12 @@ function buildVideoFilterGraph(shotImagePaths, shotStyles, tempo) {
     const colorFilter = COLOR_GRADE_FILTERS[shotStyle.color_grade] ?? COLOR_GRADE_FILTERS.vivid;
     const motion = MOTION_TYPES.includes(shotStyle.motion) ? shotStyle.motion : 'zoom_in';
     const vignetteFilter = shotStyle.vignette ? ',vignette' : '';
+    // フィルムグレイン(粒状ノイズ)。ズーム・パンだけでなく質感でも演出にバリエーションを出す。
+    const grainFilter = shotStyle.grain ? ',noise=alls=20:allf=t' : '';
 
     const basePrefix =
       `[${i}:v]${cropFilter}scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,` +
-      `crop=${WIDTH}:${HEIGHT},setsar=1,${colorFilter}${vignetteFilter}`;
+      `crop=${WIDTH}:${HEIGHT},setsar=1,${colorFilter}${vignetteFilter}${grainFilter}`;
 
     // zoompanのfpsオプションだけでは、ffmpegのビルドによって出力ストリームに
     // 「一定フレームレート」の情報がうまく伝わらず、後段のxfadeが
@@ -209,6 +218,27 @@ function buildAudioPlan({ cutOffsetsSeconds, bgPath, hitPath, videoInputCount, t
   return { filters, extraInputs };
 }
 
+// 動画冒頭に短いキャッチコピーを重ねる(AIが「似合う」と判断した場合のみ)。
+// テキストの中身を直接filter文字列に埋め込むとffmpegのフィルタ構文上の特殊文字
+// (コロン・引用符など)のエスケープが必要で壊れやすいため、textfile=で外部ファイルから読ませる。
+function buildCatchphraseFilter(catchphraseTextPath) {
+  const fontSize = Math.round(WIDTH / 16);
+  const fadeInEnd = 0.4;
+  const holdEnd = 2.6;
+  const fadeOutEnd = 3.0;
+  const alphaExpr =
+    `if(lt(t,${fadeInEnd}),t/${fadeInEnd},` +
+    `if(lt(t,${holdEnd}),1,` +
+    `if(lt(t,${fadeOutEnd}),(${fadeOutEnd}-t)/${fadeOutEnd - holdEnd},0)))`;
+
+  return (
+    `[outv]drawtext=fontfile='${escapeFilterPath(FONT_PATH)}':` +
+    `textfile='${escapeFilterPath(catchphraseTextPath)}':` +
+    `fontsize=${fontSize}:fontcolor=white:box=1:boxcolor=black@0.45:boxborderw=24:` +
+    `x=(w-text_w)/2:y=h*0.78:alpha='${alphaExpr}'[outv_text]`
+  );
+}
+
 function resolveSePath(musicMood) {
   const candidatePath = path.join(SE_DIR, `${musicMood}.mp3`);
   return existsSync(candidatePath) ? candidatePath : null;
@@ -242,7 +272,25 @@ export function generateVideo({ shotImagePaths, outPath, styleResult }) {
     totalDurationSeconds,
   });
 
-  const allFilters = audioPlan ? [...videoFilters, ...audioPlan.filters] : videoFilters;
+  // キャッチコピーはAIが「似合う」と判断したときだけ(catchphrase_shown)重ねる。
+  const catchphraseText = styleResult.catchphrase_text?.trim();
+  const showCatchphrase = Boolean(styleResult.catchphrase_shown && catchphraseText);
+  const catchphraseTextPath = showCatchphrase ? `${outPath}.catchphrase.txt` : null;
+  if (catchphraseTextPath) {
+    writeFileSync(catchphraseTextPath, catchphraseText, 'utf-8');
+  }
+
+  const allFilters = audioPlan ? [...videoFilters, ...audioPlan.filters] : [...videoFilters];
+  if (showCatchphrase) {
+    allFilters.push(buildCatchphraseFilter(catchphraseTextPath));
+  }
+  const finalVideoLabel = showCatchphrase ? '[outv_text]' : '[outv]';
+
+  const cleanup = () => {
+    if (catchphraseTextPath && existsSync(catchphraseTextPath)) {
+      unlinkSync(catchphraseTextPath);
+    }
+  };
 
   return new Promise((resolve, reject) => {
     const command = ffmpeg();
@@ -257,7 +305,7 @@ export function generateVideo({ shotImagePaths, outPath, styleResult }) {
     }
 
     const outputOptions = [
-      '-map', '[outv]',
+      '-map', finalVideoLabel,
       ...(audioPlan ? ['-map', '[outa]'] : []),
       '-c:v', 'libx264',
       // Renderの無料プラン(RAM 512MB)向けにメモリ・CPU負荷を下げる設定
@@ -274,8 +322,14 @@ export function generateVideo({ shotImagePaths, outPath, styleResult }) {
       .outputOptions(outputOptions)
       .on('start', (cmd) => console.log('[ffmpeg]', cmd))
       .on('stderr', (line) => console.log('[ffmpeg]', line))
-      .on('error', reject)
-      .on('end', () => resolve(outPath))
+      .on('error', (err) => {
+        cleanup();
+        reject(err);
+      })
+      .on('end', () => {
+        cleanup();
+        resolve(outPath);
+      })
       .save(outPath);
   });
 }
