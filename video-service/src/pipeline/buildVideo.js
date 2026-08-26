@@ -4,6 +4,7 @@ import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveHitSePath } from './ensureSe.js';
+import { hasFilter } from './ffmpegCapabilities.js';
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -103,7 +104,9 @@ function buildVideoFilterGraph(shotImagePaths, shotStyles, tempo) {
     const motion = MOTION_TYPES.includes(shotStyle.motion) ? shotStyle.motion : 'zoom_in';
     const vignetteFilter = shotStyle.vignette ? ',vignette' : '';
     // フィルムグレイン(粒状ノイズ)。ズーム・パンだけでなく質感でも演出にバリエーションを出す。
-    const grainFilter = shotStyle.grain ? ',noise=alls=20:allf=t' : '';
+    // ffmpeg-staticのバイナリによってはnoiseフィルタが入っていないことがあるため、
+    // 実際に使えるか確認してから使う(無ければ静かにスキップし、動画生成自体は止めない)。
+    const grainFilter = shotStyle.grain && hasFilter('noise') ? ',noise=alls=20:allf=t' : '';
 
     const basePrefix =
       `[${i}:v]${cropFilter}scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,` +
@@ -273,8 +276,10 @@ export function generateVideo({ shotImagePaths, outPath, styleResult }) {
   });
 
   // キャッチコピーはAIが「似合う」と判断したときだけ(catchphrase_shown)重ねる。
+  // drawtextはffmpeg-staticのバイナリにfreetypeが同梱されていないと使えないことがあるため、
+  // 実際に使えるか確認してから使う(無ければ静かにスキップし、動画生成自体は止めない)。
   const catchphraseText = styleResult.catchphrase_text?.trim();
-  const showCatchphrase = Boolean(styleResult.catchphrase_shown && catchphraseText);
+  const showCatchphrase = Boolean(styleResult.catchphrase_shown && catchphraseText && hasFilter('drawtext'));
   const catchphraseTextPath = showCatchphrase ? `${outPath}.catchphrase.txt` : null;
   if (catchphraseTextPath) {
     writeFileSync(catchphraseTextPath, catchphraseText, 'utf-8');
