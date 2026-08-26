@@ -86,7 +86,12 @@ function buildVideoFilterGraph(shotImagePaths, shotStyles, tempo) {
       // 「d×入力フレーム数の掛け算で動画が63倍に伸びる」問題は起きない。trimは念のための安全弁。
       `zoompan=z='min(zoom+${zoom.rate},${zoom.target})':x='${xExpr}':y='${yExpr}':` +
       `d=${frames}:s=${WIDTH}x${HEIGHT}:fps=${FPS},` +
-      `trim=start_frame=0:end_frame=${frames},setpts=PTS-STARTPTS[v${i}]`
+      // zoompanのfpsオプションだけでは、ffmpegのビルドによって出力ストリームに
+      // 「一定フレームレート」の情報がうまく伝わらず、後段のxfadeが
+      // "inputs needs to be a constant frame rate; current rate of 1/0 is invalid"
+      // で失敗することがある(ローカルのffmpeg 6.1では問題なかったが、Renderにデプロイした
+      // ffmpeg-staticのLinuxバイナリで発生)。fpsフィルタを明示的に挟んで固定する。
+      `trim=start_frame=0:end_frame=${frames},setpts=PTS-STARTPTS,fps=${FPS}[v${i}]`
     );
   });
 
