@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import path from 'node:path';
+import { mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { generateVideo } from './pipeline/buildVideo.js';
@@ -13,6 +14,11 @@ import { resolveShotImagePaths } from './pipeline/planShots.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
 const OUTPUT_DIR = path.join(__dirname, '..', 'output');
+
+// gitは空ディレクトリを追跡しないため、ローカルでは手動で作っていたuploads/output/が
+// Render等の本番環境には存在しない状態でデプロイされる。起動時に必ず作成する。
+mkdirSync(UPLOAD_DIR, { recursive: true });
+mkdirSync(OUTPUT_DIR, { recursive: true });
 
 const app = express();
 app.use(cors());
