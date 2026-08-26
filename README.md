@@ -13,8 +13,9 @@ Tornado2026(チーム「トルネードポテト」)の「夜行性アプリ」�
 
 1. `video-service` を先に動かす(フロントなしでcurlで動画生成を確認できる状態にする)。
 2. `frontend` から `video-service` の `/generate` を呼び、アップロード→プレビューの一連の流れを繋ぐ。
-3. AIによるスタイル選定(JSONパラメータ出力)は未確定仕様のため後回し。まずは固定パラメータでの
-   クロップ・ズーム・カット・SEミックスのパイプラインを確定させる。
+3. AIによるスタイル選定(JSONパラメータ出力)を実装済み。写真を見てテンポ・色味・ズーム強さ・
+   人物/背景の重み付け・SEの雰囲気を選び、FFmpeg側はその値通りに機械的に動画を組み立てる
+   (`video-service/src/pipeline/selectStyle.js`)。
 
 ## セットアップ
 
@@ -24,6 +25,9 @@ cd ../frontend && npm install
 ```
 
 `ffmpeg-static` がバイナリを同梱するため、システムに別途 ffmpeg をインストールする必要はない。
+
+`video-service/.env.example` を `video-service/.env` にコピーし、`ANTHROPIC_API_KEY` を設定するとAIによる
+スタイル選定が有効になる。未設定でも動画生成自体は失敗せず、固定のデフォルトスタイルにフォールバックする。
 
 ## 起動
 

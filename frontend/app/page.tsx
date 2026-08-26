@@ -5,9 +5,20 @@ import { useState, type ChangeEvent, type FormEvent } from "react";
 const VIDEO_SERVICE_URL =
   process.env.NEXT_PUBLIC_VIDEO_SERVICE_URL ?? "http://localhost:4000";
 
+type Style = {
+  tempo: string;
+  color_grade: string;
+  zoom_intensity: string;
+  focus_bias: string;
+  music_mood: string;
+  reasoning: string;
+  ai_used: boolean;
+};
+
 type GenerateResponse = {
   jobId: string;
   videoUrl: string;
+  style: Style;
 };
 
 export default function Home() {
@@ -15,6 +26,7 @@ export default function Home() {
   const [status, setStatus] = useState<"idle" | "loading" | "error">("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [style, setStyle] = useState<Style | null>(null);
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     setPhotos(Array.from(event.target.files ?? []));
@@ -27,6 +39,7 @@ export default function Home() {
     setStatus("loading");
     setErrorMessage(null);
     setVideoUrl(null);
+    setStyle(null);
 
     const formData = new FormData();
     photos.forEach((photo) => formData.append("photos", photo));
@@ -44,6 +57,7 @@ export default function Home() {
 
       const data: GenerateResponse = await res.json();
       setVideoUrl(`${VIDEO_SERVICE_URL}${data.videoUrl}`);
+      setStyle(data.style);
       setStatus("idle");
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : String(err));
@@ -96,6 +110,27 @@ export default function Home() {
             controls
             className="w-full rounded-lg border border-zinc-200 dark:border-zinc-800"
           />
+        )}
+
+        {style && (
+          <div className="rounded-lg border border-zinc-200 bg-white p-4 text-sm dark:border-zinc-800 dark:bg-zinc-900">
+            <p className="font-medium text-zinc-950 dark:text-zinc-50">
+              {style.ai_used ? "AIが選んだスタイル" : "デフォルトスタイル(AI未使用)"}
+            </p>
+            <p className="mt-1 text-zinc-600 dark:text-zinc-400">{style.reasoning}</p>
+            <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-zinc-600 dark:text-zinc-400">
+              <dt>テンポ</dt>
+              <dd>{style.tempo}</dd>
+              <dt>色味</dt>
+              <dd>{style.color_grade}</dd>
+              <dt>ズーム</dt>
+              <dd>{style.zoom_intensity}</dd>
+              <dt>フォーカス</dt>
+              <dd>{style.focus_bias}</dd>
+              <dt>SEの雰囲気</dt>
+              <dd>{style.music_mood}</dd>
+            </dl>
+          </div>
         )}
       </main>
     </div>
