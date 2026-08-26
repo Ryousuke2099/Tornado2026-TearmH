@@ -3,7 +3,6 @@ import ffmpeg from 'fluent-ffmpeg';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_STYLE } from './selectStyle.js';
 import { resolveHitSePath } from './ensureSe.js';
 
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -14,13 +13,13 @@ const SE_DIR = path.join(__dirname, '..', '..', 'assets', 'se');
 const FPS = 25;
 const WIDTH = 1080;
 const HEIGHT = 1920;
-const MAX_SHOTS = 8;
 
-// AIの役割は「どの型を使うか」の判断のみ。実際の値はここでFFmpeg側があらかじめ用意しておく
-// (video-pipeline-tech-stack.mdの「AIとFFmpegの役割分担」案)。
+// AIの役割は「どの型を使うか(ショットごと)」の判断のみ。実際の値はここでFFmpeg側が用意する
+// (video-pipeline-tech-stack.mdの「AIとFFmpegの役割分担」案)。テンポ(=尺)だけは全ショット共通の
+// ままにしている。ショットごとに尺まで変えるとxfadeの累積オフセット計算が複雑になるため、
+// ハッカソンの残り時間を踏まえてスコープ外にした。
 
 const TEMPO_SECONDS = { slow: 3.5, medium: 2.5, fast: 1.6 };
-
 // カット間のクロスフェード秒数。テンポが速いほど切り替えも短く鋭くする。
 const TRANSITION_SECONDS = { slow: 0.35, medium: 0.25, fast: 0.15 };
 
@@ -39,83 +38,46 @@ const COLOR_GRADE_FILTERS = {
   monochrome: 'hue=s=0',
 };
 
-// ショットごとにズーム時のパン方向を変え、全カット同じ「中央から真っ直ぐズーム」にならないようにする。
-// on(出力フレーム番号)/frames の比率でx/yを動かし、ズームインしながら斜めに流れる動きを作る。
-const PAN_VARIANTS = [
-  { dx: 1, dy: -1 }, // 右上へ流れながらズーム
-  { dx: -1, dy: 1 }, // 左下へ流れながらズーム
-  { dx: -1, dy: -1 }, // 左上へ流れながらズーム
-  { dx: 1, dy: 1 }, // 右下へ流れながらズーム
-];
+// パン方向。ズームインしながらon(出力フレーム番号)/framesの進行に応じて微小に動かす。
+const PAN_DRIFT = {
+  'up-left': { dx: -1, dy: -1 },
+  'up-right': { dx: 1, dy: -1 },
+  'down-left': { dx: -1, dy: 1 },
+  'down-right': { dx: 1, dy: 1 },
+  none: { dx: 0, dy: 0 },
+};
 const PAN_DRIFT_PX = 60; // ズーム中にパンで動かす最大ピクセル数(1080x1920基準)
 
-// 写真が1枚しかない場合に、同じ写真から複数領域をクロップして疑似的な複数カットを作るためのフォールバック領域。
-// focus_biasごとに切り出す位置を変える(faceは中央寄りをやや強めに、backgroundは画角を狭めない)。
-const SINGLE_PHOTO_CROPS = {
-  face: [
-    { x: 0.1, y: 0.05, w: 0.8, h: 0.8 },
-    { x: 0.25, y: 0, w: 0.5, h: 0.5 },
-    { x: 0.15, y: 0.15, w: 0.6, h: 0.6 },
-  ],
-  background: [
-    { x: 0, y: 0, w: 1, h: 1 },
-    { x: 0, y: 0.3, w: 1, h: 0.7 },
-    { x: 0.2, y: 0.2, w: 0.8, h: 0.8 },
-  ],
-  balanced: [
-    { x: 0, y: 0, w: 1, h: 1 },
-    { x: 0, y: 0, w: 0.6, h: 0.6 },
-    { x: 0.4, y: 0.4, w: 0.6, h: 0.6 },
-  ],
+// 人物(顔)中心か風景中心かで、切り出す範囲を変える。
+const FOCUS_CROPS = {
+  face: { x: 0.15, y: 0.05, w: 0.7, h: 0.7 },
+  balanced: { x: 0.05, y: 0.05, w: 0.9, h: 0.9 },
+  background: null, // 画角を狭めない
 };
-
-// 複数枚のときの追加クロップ(faceのみ中央寄りに軽く寄せる。background/balancedは画角そのまま)。
-const MULTI_PHOTO_CROP = {
-  face: { x: 0.1, y: 0.05, w: 0.8, h: 0.8 },
-  background: null,
-  balanced: null,
-};
-
-function pickShots(photoPaths, focusBias) {
-  if (photoPaths.length === 1) {
-    const crops = SINGLE_PHOTO_CROPS[focusBias] ?? SINGLE_PHOTO_CROPS.balanced;
-    return crops.map((crop) => ({ imagePath: photoPaths[0], crop }));
-  }
-
-  const crop = MULTI_PHOTO_CROP[focusBias] ?? null;
-  if (photoPaths.length <= MAX_SHOTS) {
-    return photoPaths.map((imagePath) => ({ imagePath, crop }));
-  }
-  // MAX_SHOTSを超える場合は時系列で均等に間引く。「AIがハイライトを選定」は未実装。
-  const step = photoPaths.length / MAX_SHOTS;
-  const sampled = [];
-  for (let i = 0; i < MAX_SHOTS; i += 1) {
-    sampled.push(photoPaths[Math.floor(i * step)]);
-  }
-  return sampled.map((imagePath) => ({ imagePath, crop }));
-}
 
 // 各ショットの映像フィルタ([v0][v1]...)と、それらをxfadeで繋いだ最終段[outv]を組み立てる。
-// 予告編らしさの核: ①ショットごとに違う方向へズーム+パン ②ハードカットではなくクロスフェードで繋ぐ。
-function buildVideoFilterGraph(shots, style) {
-  const shotSeconds = TEMPO_SECONDS[style.tempo] ?? TEMPO_SECONDS.medium;
-  const transitionSeconds = TRANSITION_SECONDS[style.tempo] ?? TRANSITION_SECONDS.medium;
-  const zoom = ZOOM_PARAMS[style.zoom_intensity] ?? ZOOM_PARAMS.moderate;
-  const colorFilter = COLOR_GRADE_FILTERS[style.color_grade] ?? COLOR_GRADE_FILTERS.vivid;
+// 予告編らしさの核: ①ショットごとに違う演出(パン方向・ズーム強さ・色味・ヴィネット・トランジション種類)
+// ②ハードカットではなくクロスフェードで繋ぐ。
+function buildVideoFilterGraph(shotImagePaths, shotStyles, tempo) {
+  const shotSeconds = TEMPO_SECONDS[tempo] ?? TEMPO_SECONDS.medium;
+  const transitionSeconds = TRANSITION_SECONDS[tempo] ?? TRANSITION_SECONDS.medium;
   const frames = Math.round(shotSeconds * FPS);
 
-  const perShotFilters = shots.map((shot, i) => {
-    const cropFilter = shot.crop
-      ? `crop=iw*${shot.crop.w}:ih*${shot.crop.h}:iw*${shot.crop.x}:ih*${shot.crop.y},`
-      : '';
-    const pan = PAN_VARIANTS[i % PAN_VARIANTS.length];
-    // x/yはzoompan既定の中央寄せ式に、on(出力フレーム番号)/frames の進行に応じた
-    // 微小なドリフトを足すことで、単なる中央ズームインから斜めのパンを加えた動きにしている。
+  const perShotFilters = shotImagePaths.map((_, i) => {
+    const shotStyle = shotStyles[i];
+    const crop = FOCUS_CROPS[shotStyle.focus_bias] ?? null;
+    const cropFilter = crop ? `crop=iw*${crop.w}:ih*${crop.h}:iw*${crop.x}:ih*${crop.y},` : '';
+    const zoom = ZOOM_PARAMS[shotStyle.zoom_intensity] ?? ZOOM_PARAMS.moderate;
+    const colorFilter = COLOR_GRADE_FILTERS[shotStyle.color_grade] ?? COLOR_GRADE_FILTERS.vivid;
+    const pan = PAN_DRIFT[shotStyle.pan_direction] ?? PAN_DRIFT.none;
+    const vignetteFilter = shotStyle.vignette ? ',vignette' : '';
+
     const xExpr = `iw/2-(iw/zoom/2)+${pan.dx}*${PAN_DRIFT_PX}*(on/${frames})`;
     const yExpr = `ih/2-(ih/zoom/2)+${pan.dy}*${PAN_DRIFT_PX}*(on/${frames})`;
+
     return (
       `[${i}:v]${cropFilter}scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,` +
-      `crop=${WIDTH}:${HEIGHT},setsar=1,${colorFilter},` +
+      `crop=${WIDTH}:${HEIGHT},setsar=1,${colorFilter}${vignetteFilter},` +
       // zoompanは「1つの入力フレームからd枚の出力フレームを生成し、その間だけzoom値を積み上げる」
       // 仕組みなので、d=framesにしてショットの全フレームを1回の入力フレームから作らせる必要がある
       // (d=1だと出力1枚ごとに新しい入力フレーム扱いになりzoomの積み上げが毎回リセットされ、
@@ -128,28 +90,30 @@ function buildVideoFilterGraph(shots, style) {
     );
   });
 
-  // ハードカット(concat)ではなくxfadeの連鎖で繋ぐ。全ショット同じ長さ(shotSeconds)である前提で、
-  // k番目(1始まり)のxfadeのoffsetはk*(shotSeconds-transitionSeconds)になる
-  // (導出: 1本目と2本目を繋いだ時点の尺は2L-T、そこに3本目を繋ぐ時のoffsetは(2L-T)-T=2L-2T、
-  //  以降も同様にk*(L-T)のパターンになる)。
+  // ハードカット(concat)ではなくxfadeの連鎖で繋ぐ。トランジションの「種類」はショットごとに違っても、
+  // 「長さ」は全ショット共通(transitionSeconds)にしているので、k番目(1始まり)のxfadeのoffsetは
+  // k*(shotSeconds-transitionSeconds)になる(導出: 1本目と2本目を繋いだ時点の尺は2L-T、そこに
+  // 3本目を繋ぐ時のoffsetは(2L-T)-T=2L-2T、以降も同様にk*(L-T)のパターンになる)。
   const transitionFilters = [];
   const offsetsSeconds = [];
   let outputLabel = 'v0';
-  if (shots.length === 1) {
+  if (shotImagePaths.length === 1) {
     transitionFilters.push('[v0]null[outv]');
   } else {
-    for (let i = 1; i < shots.length; i += 1) {
+    for (let i = 1; i < shotImagePaths.length; i += 1) {
       const offsetSeconds = i * (shotSeconds - transitionSeconds);
       offsetsSeconds.push(offsetSeconds);
-      const nextLabel = i === shots.length - 1 ? 'outv' : `vx${i}`;
+      const transitionType = shotStyles[i].transition_in ?? 'fade';
+      const nextLabel = i === shotImagePaths.length - 1 ? 'outv' : `vx${i}`;
       transitionFilters.push(
-        `[${outputLabel}][v${i}]xfade=transition=fade:duration=${transitionSeconds}:offset=${offsetSeconds}[${nextLabel}]`
+        `[${outputLabel}][v${i}]xfade=transition=${transitionType}:duration=${transitionSeconds}:offset=${offsetSeconds}[${nextLabel}]`
       );
       outputLabel = nextLabel;
     }
   }
 
-  const totalDurationSeconds = shots.length * shotSeconds - (shots.length - 1) * transitionSeconds;
+  const totalDurationSeconds =
+    shotImagePaths.length * shotSeconds - (shotImagePaths.length - 1) * transitionSeconds;
 
   return {
     filters: [...perShotFilters, ...transitionFilters],
@@ -209,24 +173,31 @@ function resolveSePath(musicMood) {
   return existsSync(candidatePath) ? candidatePath : null;
 }
 
-// 予告編風の可変ショット数パイプライン: 写真(複数 or 1枚)→クロップ・ズーム・パン→クロスフェード→
-// SEミックス→mp4。style(selectStyle.jsがAIまたはデフォルトで決める)に従って、テンポ・色味・
-// ズーム強さ・人物/背景の重み付け・SEを切り替える。実際の描画処理(力仕事)はすべてFFmpeg側が担う。
-export function generateVideo({ photoPaths, outPath, style = DEFAULT_STYLE }) {
-  if (!photoPaths || photoPaths.length === 0) {
-    return Promise.reject(new Error('photoPaths is empty'));
+// 予告編風の可変ショット数パイプライン: 写真→ショットごとのクロップ・ズーム・パン・色味・ヴィネット→
+// ショットごとに違うトランジションで連結→SEミックス→mp4。styleResult(selectStyle.jsがAIまたは
+// デフォルトで決める)に従って、ショットごとの演出とテンポ・SEを切り替える。実際の描画処理
+// (力仕事)はすべてFFmpeg側が担う。
+export function generateVideo({ shotImagePaths, outPath, styleResult }) {
+  if (!shotImagePaths || shotImagePaths.length === 0) {
+    return Promise.reject(new Error('shotImagePaths is empty'));
+  }
+  if (!styleResult?.shots || styleResult.shots.length !== shotImagePaths.length) {
+    return Promise.reject(new Error('styleResult.shots must match shotImagePaths length'));
   }
 
-  const shots = pickShots(photoPaths, style.focus_bias);
-  const { filters: videoFilters, cutOffsetsSeconds, totalDurationSeconds } = buildVideoFilterGraph(shots, style);
+  const { filters: videoFilters, cutOffsetsSeconds, totalDurationSeconds } = buildVideoFilterGraph(
+    shotImagePaths,
+    styleResult.shots,
+    styleResult.tempo
+  );
 
-  const bgPath = resolveSePath(style.music_mood);
-  const hitPath = resolveHitSePath(style.music_mood);
+  const bgPath = resolveSePath(styleResult.music_mood);
+  const hitPath = resolveHitSePath(styleResult.music_mood);
   const audioPlan = buildAudioPlan({
     cutOffsetsSeconds,
     bgPath,
     hitPath,
-    videoInputCount: shots.length,
+    videoInputCount: shotImagePaths.length,
     totalDurationSeconds,
   });
 
@@ -235,9 +206,9 @@ export function generateVideo({ photoPaths, outPath, style = DEFAULT_STYLE }) {
   return new Promise((resolve, reject) => {
     const command = ffmpeg();
 
-    shots.forEach((shot) => {
+    shotImagePaths.forEach((imagePath) => {
       // -tは付けない(無限ループの静止画入力にして、フィルタ側のtrimで長さを確定する)
-      command.input(shot.imagePath).inputOptions(['-loop 1', `-framerate ${FPS}`]);
+      command.input(imagePath).inputOptions(['-loop 1', `-framerate ${FPS}`]);
     });
 
     if (audioPlan) {

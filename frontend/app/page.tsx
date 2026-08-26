@@ -5,14 +5,21 @@ import { useState, type ChangeEvent, type FormEvent } from "react";
 const VIDEO_SERVICE_URL =
   process.env.NEXT_PUBLIC_VIDEO_SERVICE_URL ?? "http://localhost:4000";
 
+type ShotStyle = {
+  focus_bias: string;
+  pan_direction: string;
+  zoom_intensity: string;
+  color_grade: string;
+  vignette: boolean;
+  transition_in: string;
+};
+
 type Style = {
   tempo: string;
-  color_grade: string;
-  zoom_intensity: string;
-  focus_bias: string;
   music_mood: string;
   reasoning: string;
   ai_used: boolean;
+  shots: ShotStyle[];
 };
 
 type GenerateResponse = {
@@ -121,15 +128,24 @@ export default function Home() {
             <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-zinc-600 dark:text-zinc-400">
               <dt>テンポ</dt>
               <dd>{style.tempo}</dd>
-              <dt>色味</dt>
-              <dd>{style.color_grade}</dd>
-              <dt>ズーム</dt>
-              <dd>{style.zoom_intensity}</dd>
-              <dt>フォーカス</dt>
-              <dd>{style.focus_bias}</dd>
               <dt>SEの雰囲気</dt>
               <dd>{style.music_mood}</dd>
             </dl>
+            <p className="mt-4 font-medium text-zinc-950 dark:text-zinc-50">
+              ショットごとの演出({style.shots.length}カット)
+            </p>
+            <ol className="mt-2 flex flex-col gap-2">
+              {style.shots.map((shot, i) => (
+                <li
+                  key={i}
+                  className="rounded border border-zinc-200 p-2 text-xs text-zinc-600 dark:border-zinc-800 dark:text-zinc-400"
+                >
+                  #{i + 1}: {shot.focus_bias} / パン{shot.pan_direction} / ズーム{shot.zoom_intensity} /{" "}
+                  {shot.color_grade} / ヴィネット{shot.vignette ? "あり" : "なし"}
+                  {i > 0 && ` / トランジション${shot.transition_in}`}
+                </li>
+              ))}
+            </ol>
           </div>
         )}
       </main>

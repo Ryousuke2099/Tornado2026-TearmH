@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { generateVideo } from './pipeline/buildVideo.js';
 import { selectStyle } from './pipeline/selectStyle.js';
 import { ensureSeAssets } from './pipeline/ensureSe.js';
+import { resolveShotImagePaths } from './pipeline/planShots.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
@@ -32,10 +33,12 @@ app.post('/generate', upload.array('photos', 20), async (req, res) => {
   const photoPaths = req.files.map((f) => f.path);
 
   try {
+    // 「どの写真をどのショットに使うか」を先に決めてから、AIにショットごとの演出を判断させる。
     // AIはFFmpegに渡すスタイルパラメータ(JSON)を選ぶだけで、動画そのものは生成しない。
-    const style = await selectStyle(photoPaths);
-    await generateVideo({ photoPaths, outPath, style });
-    res.json({ jobId, videoUrl: `/output/${jobId}.mp4`, style });
+    const shotImagePaths = resolveShotImagePaths(photoPaths);
+    const styleResult = await selectStyle(shotImagePaths);
+    await generateVideo({ shotImagePaths, outPath, styleResult });
+    res.json({ jobId, videoUrl: `/output/${jobId}.mp4`, style: styleResult });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: '動画生成に失敗しました', detail: String(err) });
