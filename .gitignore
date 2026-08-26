@@ -1,0 +1,7 @@
+node_modules/
+.next/
+video-service/uploads/
+video-service/output/
+.env
+.env.local
+*.log
