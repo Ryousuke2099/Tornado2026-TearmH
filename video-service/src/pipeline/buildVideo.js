@@ -180,8 +180,15 @@ function buildAudioPlan({ cutOffsetsSeconds, bgPath, hitPath, videoInputCount, t
   if (bgPath) {
     const idx = nextInputIndex;
     nextInputIndex += 1;
-    extraInputs.push(bgPath);
-    filters.push(`[${idx}:a]aformat=sample_rates=44100:channel_layouts=stereo[bg]`);
+    // BGM素材は数秒の短いループ素材なので、動画の尺いっぱいに-stream_loop -1で無限リピート
+    // させて入力する(見た目のループ処理としてzoompan等で使っている-loop 1の音声版)。
+    // 無限入力のままだと際限なく伸びる(過去に同じ理由でzoompan/apadがハングした)ため、
+    // atrimで動画の総尺ちょうどに切り詰める。
+    extraInputs.push({ path: bgPath, loop: true });
+    filters.push(
+      `[${idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,` +
+        `atrim=duration=${totalDurationSeconds},asetpts=PTS-STARTPTS[bg]`
+    );
     mixLabels.push('[bg]');
   }
 
@@ -189,7 +196,7 @@ function buildAudioPlan({ cutOffsetsSeconds, bgPath, hitPath, videoInputCount, t
     cutOffsetsSeconds.forEach((offsetSeconds, i) => {
       const idx = nextInputIndex;
       nextInputIndex += 1;
-      extraInputs.push(hitPath);
+      extraInputs.push({ path: hitPath, loop: false });
       const delayMs = Math.max(0, Math.round(offsetSeconds * 1000));
       const label = `hit${i}`;
       filters.push(
@@ -317,7 +324,10 @@ export async function generateVideo({ shotImagePaths, outPath, styleResult }) {
     }
 
     if (audioPlan) {
-      audioPlan.extraInputs.forEach((inputPath) => command.input(inputPath));
+      audioPlan.extraInputs.forEach(({ path: inputPath, loop }) => {
+        const input = command.input(inputPath);
+        if (loop) input.inputOptions(['-stream_loop', '-1']);
+      });
     }
 
     const outputOptions = [
