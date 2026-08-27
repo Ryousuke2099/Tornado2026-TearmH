@@ -1,22 +1,16 @@
 import ffmpegPath from 'ffmpeg-static';
 import ffmpeg from 'fluent-ffmpeg';
-import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveHitSePath } from './ensureSe.js';
 import { hasFilter } from './ffmpegCapabilities.js';
+import { renderCatchphraseImage } from './renderCatchphrase.js';
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SE_DIR = path.join(__dirname, '..', '..', 'assets', 'se');
-const FONT_PATH = path.join(__dirname, '..', '..', 'assets', 'fonts', 'NotoSansJP.ttf');
-
-// FFmpegのフィルタグラフでは`\`と`:`が特殊文字になるため、Windowsの絶対パス
-// (例: C:\Users\...)をfontfile=/textfile=にそのまま渡すと壊れる。エスケープする。
-function escapeFilterPath(filePath) {
-  return filePath.replace(/\\/g, '/').replace(/:/g, '\\:');
-}
 
 const FPS = 25;
 // Renderの無料プラン(RAM 512MB)でOOM Kill(exit 137)が発生したため、1080x1920から解像度を
@@ -222,24 +216,28 @@ function buildAudioPlan({ cutOffsetsSeconds, bgPath, hitPath, videoInputCount, t
 }
 
 // 動画冒頭に短いキャッチコピーを重ねる(AIが「似合う」と判断した場合のみ)。
-// テキストの中身を直接filter文字列に埋め込むとffmpegのフィルタ構文上の特殊文字
-// (コロン・引用符など)のエスケープが必要で壊れやすいため、textfile=で外部ファイルから読ませる。
-function buildCatchphraseFilter(catchphraseTextPath) {
-  const fontSize = Math.round(WIDTH / 16);
+// FFmpegの`drawtext`(freetype同梱ビルドが必要)がRenderのffmpeg-staticバイナリに
+// 入っておらず使えなかったため、テキストはrenderCatchphrase.js側でsharpにより
+// 透過PNG画像として事前に描画し、ここではその画像をほぼ全ビルドに入っている
+// 基本機能`overlay`で動画に重ねるだけにする(drawtext不要)。
+// fadeフィルタのalpha=1オプションで、画像そのものではなくアルファチャンネルを
+// フェードさせ、下の映像を透かしながら滑らかに現れて消えるようにしている。
+function buildCatchphraseFilter(imageInputIndex, catchphraseY, totalDurationSeconds) {
   const fadeInEnd = 0.4;
   const holdEnd = 2.6;
-  const fadeOutEnd = 3.0;
-  const alphaExpr =
-    `if(lt(t,${fadeInEnd}),t/${fadeInEnd},` +
-    `if(lt(t,${holdEnd}),1,` +
-    `if(lt(t,${fadeOutEnd}),(${fadeOutEnd}-t)/${fadeOutEnd - holdEnd},0)))`;
+  const fadeOutStart = holdEnd;
+  const fadeOutDuration = 0.4;
+  // キャッチコピー画像の入力は-loop 1で無限に供給されるため、trimで明示的に動画全体の
+  // 長さへ切らないと(zoompanで一度踏んだのと同じ理由で)出力が際限なく伸びてしまう。
+  const totalFrames = Math.round(totalDurationSeconds * FPS);
 
-  return (
-    `[outv]drawtext=fontfile='${escapeFilterPath(FONT_PATH)}':` +
-    `textfile='${escapeFilterPath(catchphraseTextPath)}':` +
-    `fontsize=${fontSize}:fontcolor=white:box=1:boxcolor=black@0.45:boxborderw=24:` +
-    `x=(w-text_w)/2:y=h*0.78:alpha='${alphaExpr}'[outv_text]`
-  );
+  return [
+    `[${imageInputIndex}:v]format=rgba,` +
+      `fade=t=in:st=0:d=${fadeInEnd}:alpha=1,` +
+      `fade=t=out:st=${fadeOutStart}:d=${fadeOutDuration}:alpha=1,` +
+      `trim=start_frame=0:end_frame=${totalFrames},setpts=PTS-STARTPTS[textlayer]`,
+    `[outv][textlayer]overlay=x=0:y=${catchphraseY}:enable='between(t,0,${fadeOutStart + fadeOutDuration})'[outv_text]`,
+  ];
 }
 
 function resolveSePath(musicMood) {
@@ -251,12 +249,12 @@ function resolveSePath(musicMood) {
 // ショットごとに違うトランジションで連結→SEミックス→mp4。styleResult(selectStyle.jsがAIまたは
 // デフォルトで決める)に従って、ショットごとの演出とテンポ・SEを切り替える。実際の描画処理
 // (力仕事)はすべてFFmpeg側が担う。
-export function generateVideo({ shotImagePaths, outPath, styleResult }) {
+export async function generateVideo({ shotImagePaths, outPath, styleResult }) {
   if (!shotImagePaths || shotImagePaths.length === 0) {
-    return Promise.reject(new Error('shotImagePaths is empty'));
+    throw new Error('shotImagePaths is empty');
   }
   if (!styleResult?.shots || styleResult.shots.length !== shotImagePaths.length) {
-    return Promise.reject(new Error('styleResult.shots must match shotImagePaths length'));
+    throw new Error('styleResult.shots must match shotImagePaths length');
   }
 
   const { filters: videoFilters, cutOffsetsSeconds, totalDurationSeconds } = buildVideoFilterGraph(
@@ -265,35 +263,44 @@ export function generateVideo({ shotImagePaths, outPath, styleResult }) {
     styleResult.tempo
   );
 
+  // キャッチコピーはAIが「似合う」と判断したときだけ(catchphrase_shown)重ねる。
+  // overlayはほぼ全てのffmpegビルドに入っている基本機能だが、念のため確認してから使う
+  // (無ければ静かにスキップし、動画生成自体は止めない)。
+  const catchphraseText = styleResult.catchphrase_text?.trim();
+  const showCatchphrase = Boolean(styleResult.catchphrase_shown && catchphraseText && hasFilter('overlay'));
+  const catchphraseImagePath = showCatchphrase ? `${outPath}.catchphrase.png` : null;
+  let catchphraseBoxHeight = 0;
+  if (catchphraseImagePath) {
+    ({ boxHeight: catchphraseBoxHeight } = await renderCatchphraseImage({
+      text: catchphraseText,
+      videoWidth: WIDTH,
+      outPath: catchphraseImagePath,
+    }));
+  }
+
+  // キャッチコピー画像を入れる場合、ショット画像の直後・音声入力の直前に1本追加で
+  // ffmpegの入力に足すことになるため、音声側のinputインデックス計算をずらす必要がある。
+  const catchphraseInputIndex = shotImagePaths.length;
   const bgPath = resolveSePath(styleResult.music_mood);
   const hitPath = resolveHitSePath(styleResult.music_mood);
   const audioPlan = buildAudioPlan({
     cutOffsetsSeconds,
     bgPath,
     hitPath,
-    videoInputCount: shotImagePaths.length,
+    videoInputCount: shotImagePaths.length + (showCatchphrase ? 1 : 0),
     totalDurationSeconds,
   });
 
-  // キャッチコピーはAIが「似合う」と判断したときだけ(catchphrase_shown)重ねる。
-  // drawtextはffmpeg-staticのバイナリにfreetypeが同梱されていないと使えないことがあるため、
-  // 実際に使えるか確認してから使う(無ければ静かにスキップし、動画生成自体は止めない)。
-  const catchphraseText = styleResult.catchphrase_text?.trim();
-  const showCatchphrase = Boolean(styleResult.catchphrase_shown && catchphraseText && hasFilter('drawtext'));
-  const catchphraseTextPath = showCatchphrase ? `${outPath}.catchphrase.txt` : null;
-  if (catchphraseTextPath) {
-    writeFileSync(catchphraseTextPath, catchphraseText, 'utf-8');
-  }
-
   const allFilters = audioPlan ? [...videoFilters, ...audioPlan.filters] : [...videoFilters];
   if (showCatchphrase) {
-    allFilters.push(buildCatchphraseFilter(catchphraseTextPath));
+    const catchphraseY = Math.round(HEIGHT * 0.78) - catchphraseBoxHeight;
+    allFilters.push(...buildCatchphraseFilter(catchphraseInputIndex, catchphraseY, totalDurationSeconds));
   }
   const finalVideoLabel = showCatchphrase ? '[outv_text]' : '[outv]';
 
   const cleanup = () => {
-    if (catchphraseTextPath && existsSync(catchphraseTextPath)) {
-      unlinkSync(catchphraseTextPath);
+    if (catchphraseImagePath && existsSync(catchphraseImagePath)) {
+      unlinkSync(catchphraseImagePath);
     }
   };
 
@@ -304,6 +311,10 @@ export function generateVideo({ shotImagePaths, outPath, styleResult }) {
       // -tは付けない(無限ループの静止画入力にして、フィルタ側のtrimで長さを確定する)
       command.input(imagePath).inputOptions(['-loop 1', `-framerate ${FPS}`]);
     });
+
+    if (showCatchphrase) {
+      command.input(catchphraseImagePath).inputOptions(['-loop 1', `-framerate ${FPS}`]);
+    }
 
     if (audioPlan) {
       audioPlan.extraInputs.forEach((inputPath) => command.input(inputPath));
