@@ -2,7 +2,6 @@ node_modules/
 .next/
 video-service/uploads/
 video-service/output/
-video-service/assets/se/*-hit.mp3
 .env
 .env.local
 *.log
