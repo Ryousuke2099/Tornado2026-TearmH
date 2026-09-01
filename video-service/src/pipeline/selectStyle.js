@@ -130,25 +130,39 @@ function toGeminiImagePart(filePath) {
   return { inlineData: { mimeType: mediaType, data: buffer.toString('base64') } };
 }
 
-function buildPromptText(shotCount, isSinglePhotoFallback) {
+function buildPromptText(shotCount, uniqueCount) {
   const catchphraseNote =
     '動画冒頭に短い日本語キャッチコピーを重ねるかどうかも判断してください。' +
     '写真の雰囲気に合う一言が思いつく場合だけcatchphrase_shownをtrueにし、' +
     '14文字以内の短い1行をcatchphrase_textに入れてください。無理に付けなくてよく、' +
     '合わないと感じたらcatchphrase_shownはfalse、catchphrase_textは空文字にしてください。';
 
-  return (
-    (isSinglePhotoFallback
-      ? `これは交換日記アプリのための写真です。写真が1枚しかないため、同じ写真を${shotCount}個の異なる` +
-        'クロップ・演出でショットとして使い、疑似的に複数カットの予告編風動画にします。' +
-        `shotsには順番に${shotCount}件、それぞれ違うfocus_bias/motion/pan_direction/zoom_intensity/color_gradeの` +
-        '組み合わせを選び、単調にならないようにしてください(1件目はtransition_inを無視して構いません)。'
-      : 'これは交換日記アプリのために、ある人が今日撮った写真です。写真は時系列の順番で並んでいます。' +
-        `shotsには写真の順番通りに${shotCount}件返してください。それぞれの写真の内容・雰囲気・` +
-        '被写体(人物中心か景色中心か)に合わせて、ショットごとに違う演出を判断してください' +
-        '(全ショット同じ組み合わせにならないよう変化をつけてください。1件目のtransition_inは無視されます)。') +
-    catchphraseNote
-  );
+  let intro;
+  if (uniqueCount === 1) {
+    intro =
+      `これは交換日記アプリのための写真です。写真が1枚しかないため、同じ写真を${shotCount}個の異なる` +
+      'クロップ・演出でショットとして使い、疑似的に複数カットの予告編風動画にします。' +
+      `shotsには順番に${shotCount}件、それぞれ違うfocus_bias/motion/pan_direction/zoom_intensity/color_gradeの` +
+      '組み合わせを選び、単調にならないようにしてください(1件目はtransition_inを無視して構いません)。';
+  } else if (uniqueCount < shotCount) {
+    // 写真が少ないと動画が短くなりすぎるため、一部の写真を複数ショットで使い回して尺を補う。
+    // AIには「同じ写真が再登場するショットでは演出を変えてほしい」とだけ伝える(どの写真を
+    // どのショットに割り当てるかは planShots.js が既に確定済み)。
+    intro =
+      `これは交換日記アプリのために、ある人が今日撮った写真です(時系列順、${uniqueCount}枚)。` +
+      `写真が少ないため一部の写真は複数のショットで使い回し、合計${shotCount}カットの予告編風動画にします。` +
+      `shotsは${shotCount}件返してください。同じ写真が再登場するショットでは、前と違う` +
+      'focus_bias/motion/pan_direction/zoom_intensity/color_gradeを選び、繰り返し感が出ないように' +
+      'してください(1件目のtransition_inは無視されます)。';
+  } else {
+    intro =
+      'これは交換日記アプリのために、ある人が今日撮った写真です。写真は時系列の順番で並んでいます。' +
+      `shotsには写真の順番通りに${shotCount}件返してください。それぞれの写真の内容・雰囲気・` +
+      '被写体(人物中心か景色中心か)に合わせて、ショットごとに違う演出を判断してください' +
+      '(全ショット同じ組み合わせにならないよう変化をつけてください。1件目のtransition_inは無視されます)。';
+  }
+
+  return intro + catchphraseNote;
 }
 
 function validateShots(shots, shotCount) {
@@ -218,8 +232,7 @@ async function selectStyleWithClaude(uniquePaths, promptText, shotCount) {
 export async function selectStyle(shotImagePaths) {
   const shotCount = shotImagePaths.length;
   const uniquePaths = [...new Set(shotImagePaths)];
-  const isSinglePhotoFallback = uniquePaths.length === 1 && shotCount > 1;
-  const promptText = buildPromptText(shotCount, isSinglePhotoFallback);
+  const promptText = buildPromptText(shotCount, uniquePaths.length);
 
   if (getGeminiClient()) {
     try {

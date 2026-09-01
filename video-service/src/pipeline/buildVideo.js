@@ -19,13 +19,20 @@ const WIDTH = 720;
 const HEIGHT = 1280;
 
 // AIの役割は「どの型を使うか(ショットごと)」の判断のみ。実際の値はここでFFmpeg側が用意する
-// (video-pipeline-tech-stack.mdの「AIとFFmpegの役割分担」案)。テンポ(=尺)だけは全ショット共通の
+// (video-pipeline-tech-stack.mdの「AIとFFmpegの役割分担」案)。テンポ(=尺)は原則全ショット共通の
 // ままにしている。ショットごとに尺まで変えるとxfadeの累積オフセット計算が複雑になるため、
 // ハッカソンの残り時間を踏まえてスコープ外にした。
 
 const TEMPO_SECONDS = { slow: 3.5, medium: 2.5, fast: 1.6 };
 // カット間のクロスフェード秒数。テンポが速いほど切り替えも短く鋭くする。
 const TRANSITION_SECONDS = { slow: 0.35, medium: 0.25, fast: 0.15 };
+
+// 写真(=ショット)が少ないと動画が短くなりすぎる(3枚で約7秒)。総尺がこの秒数を下回る場合は
+// ショット尺を必要分だけ伸ばしてここに寄せ、同時にカット切り替えもslow相当までゆっくりにして
+// 「動画」として成立させる。1ショットが長くなりすぎて退屈にならないようMAX_SHOT_SECONDSで頭打ち。
+// 由来: 検証フィードバック 2026-08-31 杉谷「3枚だと動画というには短い/切替をゆっくりに」。
+const TARGET_MIN_TOTAL_SECONDS = 15;
+const MAX_SHOT_SECONDS = 5;
 
 const ZOOM_PARAMS = {
   subtle: { target: 1.08, rate: 0.0008 },
@@ -85,8 +92,22 @@ const FOCUS_CROPS = {
 // 予告編らしさの核: ①ショットごとに違う演出(パン方向・ズーム強さ・色味・ヴィネット・トランジション種類)
 // ②ハードカットではなくクロスフェードで繋ぐ。
 function buildVideoFilterGraph(shotImagePaths, shotStyles, tempo) {
-  const shotSeconds = TEMPO_SECONDS[tempo] ?? TEMPO_SECONDS.medium;
-  const transitionSeconds = TRANSITION_SECONDS[tempo] ?? TRANSITION_SECONDS.medium;
+  let shotSeconds = TEMPO_SECONDS[tempo] ?? TEMPO_SECONDS.medium;
+  let transitionSeconds = TRANSITION_SECONDS[tempo] ?? TRANSITION_SECONDS.medium;
+
+  // ショット数が少なく総尺が短すぎる場合の補正。ショット尺を必要分だけ伸ばして
+  // TARGET_MIN_TOTAL_SECONDSに寄せ(MAX_SHOT_SECONDSで頭打ち)、切り替えもslow相当まで
+  // ゆっくりにする。以降のoffset計算・総尺はすべてこの2値から導出されるので、
+  // ここで確定させておけば全体の整合は保たれる(元々テンポ=尺は全ショット共通の設計)。
+  const shotCount = shotImagePaths.length;
+  const rawTotalSeconds = shotCount * shotSeconds - (shotCount - 1) * transitionSeconds;
+  if (rawTotalSeconds < TARGET_MIN_TOTAL_SECONDS) {
+    const neededShotSeconds =
+      (TARGET_MIN_TOTAL_SECONDS + (shotCount - 1) * transitionSeconds) / shotCount;
+    shotSeconds = Math.min(MAX_SHOT_SECONDS, Math.max(shotSeconds, neededShotSeconds));
+    transitionSeconds = Math.max(transitionSeconds, TRANSITION_SECONDS.slow);
+  }
+
   const frames = Math.round(shotSeconds * FPS);
 
   const perShotFilters = shotImagePaths.map((_, i) => {
