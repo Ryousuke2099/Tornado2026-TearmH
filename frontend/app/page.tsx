@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, type ChangeEvent, type FormEvent } from "react";
+import NudgeSettings from "./components/NudgeSettings";
 
 const VIDEO_SERVICE_URL =
   process.env.NEXT_PUBLIC_VIDEO_SERVICE_URL ?? "http://localhost:4000";
@@ -159,6 +160,8 @@ export default function Home() {
             </ol>
           </div>
         )}
+
+        <NudgeSettings />
       </main>
     </div>
   );
