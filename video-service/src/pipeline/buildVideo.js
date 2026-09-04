@@ -28,8 +28,12 @@ const TRANSITION_SECONDS = { slow: 0.35, medium: 0.25, fast: 0.15 };
 
 // 写真(=ショット)が少ないと動画が短くなりすぎる。総尺がこの秒数を下回る場合は
 // ショット尺を必要分だけ伸ばしてここに寄せ、切り替えもslow相当までゆっくりにする。
-// 由来: 検証フィードバック 2026-08-31 杉谷。
-const TARGET_MIN_TOTAL_SECONDS = 15;
+// 由来: 検証フィードバック 2026-08-31 杉谷「3枚だと動画というには短い」。
+// 2026-09-04 に15秒→30秒へ引き上げ(15秒でもまだ短いとの追加FB)。
+// この値は planShots.js の MIN_SHOTS の根拠にもなっている(揃えて変更すること) —
+// MIN_SHOTS はここでの再伸長が MAX_SHOT_SECONDS の頭打ちに当たらずに済む
+// 最小ショット数として逆算してある。
+const TARGET_MIN_TOTAL_SECONDS = 30;
 const MAX_SHOT_SECONDS = 5;
 
 const ZOOM_PARAMS = {
