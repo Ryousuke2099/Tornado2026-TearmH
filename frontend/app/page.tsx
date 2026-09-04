@@ -40,6 +40,7 @@ export default function Home() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [style, setStyle] = useState<Style | null>(null);
+  const [copied, setCopied] = useState(false);
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     setPhotos(Array.from(event.target.files ?? []));
@@ -117,12 +118,32 @@ export default function Home() {
         )}
 
         {videoUrl && (
-          <video
-            key={videoUrl}
-            src={videoUrl}
-            controls
-            className="w-full rounded-lg border border-zinc-200 dark:border-zinc-800"
-          />
+          <div className="flex flex-col gap-2">
+            <video
+              key={videoUrl}
+              src={videoUrl}
+              controls
+              className="w-full rounded-lg border border-zinc-200 dark:border-zinc-800"
+            />
+            {/* 交換日記アプリ(Woolink)は別デプロイの独立アプリで、この動画を
+                直接送れない。URLをコピーして日記の本文に貼ると、相手が読む
+                ときに自動で埋め込み再生される。 */}
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(videoUrl);
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1500);
+                } catch {
+                  // クリップボード権限が無い環境では静かに諦める
+                }
+              }}
+              className="self-start rounded-full bg-zinc-950 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-zinc-800 dark:bg-zinc-50 dark:text-zinc-950 dark:hover:bg-zinc-200"
+            >
+              {copied ? "コピーしました！" : "URLをコピー(交換日記に貼り付けできます)"}
+            </button>
+          </div>
         )}
 
         {style && (
