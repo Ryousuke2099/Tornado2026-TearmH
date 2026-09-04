@@ -1,4 +1,7 @@
-export const MAX_SHOTS = 8;
+// buildVideo.js を「1ショットずつ描画→合成」の2フェーズにしたことで、メモリが
+// ショット数にほぼ比例しなくなった(以前は巨大な filter_complex がRenderの512MBで
+// OOM Killされていた)。負荷を絞りたい環境では MAX_SHOTS 環境変数で上書きできる。
+export const MAX_SHOTS = Number(process.env.MAX_SHOTS) || 8;
 
 // 予告編としてのリズムを作るのに要る最小ショット数。写真がこれ未満だと動画が短く
 // なりすぎる(2枚≒4.75秒)ため、写真を巡回させてこの数までショットを水増しする。

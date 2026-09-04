@@ -13,24 +13,22 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SE_DIR = path.join(__dirname, '..', '..', 'assets', 'se');
 
 const FPS = 25;
-// Renderの無料プラン(RAM 512MB)でOOM Kill(exit 137)が発生したため、1080x1920から解像度を
-// 落として負荷を下げている。ハッカソンのプロトタイプ検証用途では画質より安定動作を優先。
+// Renderの無料プラン(RAM 512MB)向けに 1080x1920 から落としてある。
+// 根本対応(ショットを1本ずつ描画)後は解像度を戻す余地があるが、合成フェーズで
+// クリップ本数ぶんのH.264デコーダを同時に開くため、まずは安全側の720pのままにする。
 const WIDTH = 720;
 const HEIGHT = 1280;
 
-// AIの役割は「どの型を使うか(ショットごと)」の判断のみ。実際の値はここでFFmpeg側が用意する
-// (video-pipeline-tech-stack.mdの「AIとFFmpegの役割分担」案)。テンポ(=尺)は原則全ショット共通の
-// ままにしている。ショットごとに尺まで変えるとxfadeの累積オフセット計算が複雑になるため、
-// ハッカソンの残り時間を踏まえてスコープ外にした。
-
+// AIの役割は「どの型を使うか(ショットごと)」の判断のみ。実際の値はここでFFmpeg側が用意する。
+// テンポ(=尺)は原則全ショット共通。ショットごとに尺まで変えるとxfadeの累積オフセット計算が
+// 複雑になるためスコープ外。
 const TEMPO_SECONDS = { slow: 3.5, medium: 2.5, fast: 1.6 };
 // カット間のクロスフェード秒数。テンポが速いほど切り替えも短く鋭くする。
 const TRANSITION_SECONDS = { slow: 0.35, medium: 0.25, fast: 0.15 };
 
-// 写真(=ショット)が少ないと動画が短くなりすぎる(3枚で約7秒)。総尺がこの秒数を下回る場合は
-// ショット尺を必要分だけ伸ばしてここに寄せ、同時にカット切り替えもslow相当までゆっくりにして
-// 「動画」として成立させる。1ショットが長くなりすぎて退屈にならないようMAX_SHOT_SECONDSで頭打ち。
-// 由来: 検証フィードバック 2026-08-31 杉谷「3枚だと動画というには短い/切替をゆっくりに」。
+// 写真(=ショット)が少ないと動画が短くなりすぎる。総尺がこの秒数を下回る場合は
+// ショット尺を必要分だけ伸ばしてここに寄せ、切り替えもslow相当までゆっくりにする。
+// 由来: 検証フィードバック 2026-08-31 杉谷。
 const TARGET_MIN_TOTAL_SECONDS = 15;
 const MAX_SHOT_SECONDS = 5;
 
@@ -49,15 +47,11 @@ const COLOR_GRADE_FILTERS = {
   monochrome: 'hue=s=0',
 };
 
-// 演出の「動きの種類」。以前は全ショット固定でzoompanのズームインしかしていなかったが、
-// 「演出をズームに固定するな」との指摘を受けて4種類に分けた。
-// - zoom_in: 従来通りズームインしながらパン
-// - zoom_out: ズームアウト(最初から寄っていて引いていく)。zoompanの'zoom'変数はon(フレーム番号)が
-//   0のときだけ明示的にtarget値を返し、以降はそこから減算する式にすることで実現している
-//   (reverseフィルタで映像を逆再生する案もあるが、フレームをすべてメモリに溜め込む必要があり
-//   Renderの512MBプランでOOMを起こしたばかりなので採用しなかった)
-// - static: 完全に静止(zoompan自体を使わない)。動きの無いカットも混ぜて緩急をつける
-// - pan_only: ズームは固定倍率のまま変化させず、パンだけで動きを出す
+// 演出の「動きの種類」。
+// - zoom_in: ズームインしながらパン
+// - zoom_out: ズームアウト(最初から寄っていて引いていく)
+// - static: 完全に静止(zoompan自体を使わない)
+// - pan_only: ズームは固定倍率のまま、パンだけで動きを出す
 const MOTION_TYPES = ['zoom_in', 'zoom_out', 'static', 'pan_only'];
 
 function buildZoomExpr(motion, zoom) {
@@ -71,7 +65,7 @@ function buildZoomExpr(motion, zoom) {
   return `min(zoom+${zoom.rate},${zoom.target})`;
 }
 
-// パン方向。ズームインしながらon(出力フレーム番号)/framesの進行に応じて微小に動かす。
+// パン方向。ズーム中にon(出力フレーム番号)/framesの進行に応じて微小に動かす。
 const PAN_DRIFT = {
   'up-left': { dx: -1, dy: -1 },
   'up-right': { dx: 1, dy: -1 },
@@ -79,7 +73,7 @@ const PAN_DRIFT = {
   'down-right': { dx: 1, dy: 1 },
   none: { dx: 0, dy: 0 },
 };
-const PAN_DRIFT_PX = 60; // ズーム中にパンで動かす最大ピクセル数(1080x1920基準)
+const PAN_DRIFT_PX = 60; // ズーム中にパンで動かす最大ピクセル数
 
 // 人物(顔)中心か風景中心かで、切り出す範囲を変える。
 const FOCUS_CROPS = {
@@ -88,18 +82,14 @@ const FOCUS_CROPS = {
   background: null, // 画角を狭めない
 };
 
-// 各ショットの映像フィルタ([v0][v1]...)と、それらをxfadeで繋いだ最終段[outv]を組み立てる。
-// 予告編らしさの核: ①ショットごとに違う演出(パン方向・ズーム強さ・色味・ヴィネット・トランジション種類)
-// ②ハードカットではなくクロスフェードで繋ぐ。
-function buildVideoFilterGraph(shotImagePaths, shotStyles, tempo) {
+// ─────────────────────────────────────────────────────────────────────────
+// タイミング(全ショット共通の尺・トランジション・カット位置)を先に確定する。
+// xfadeのoffsetもSEのディレイもここから導出されるので、一度計算すれば全体の整合が保たれる。
+// ─────────────────────────────────────────────────────────────────────────
+function computeTiming(shotCount, tempo) {
   let shotSeconds = TEMPO_SECONDS[tempo] ?? TEMPO_SECONDS.medium;
   let transitionSeconds = TRANSITION_SECONDS[tempo] ?? TRANSITION_SECONDS.medium;
 
-  // ショット数が少なく総尺が短すぎる場合の補正。ショット尺を必要分だけ伸ばして
-  // TARGET_MIN_TOTAL_SECONDSに寄せ(MAX_SHOT_SECONDSで頭打ち)、切り替えもslow相当まで
-  // ゆっくりにする。以降のoffset計算・総尺はすべてこの2値から導出されるので、
-  // ここで確定させておけば全体の整合は保たれる(元々テンポ=尺は全ショット共通の設計)。
-  const shotCount = shotImagePaths.length;
   const rawTotalSeconds = shotCount * shotSeconds - (shotCount - 1) * transitionSeconds;
   if (rawTotalSeconds < TARGET_MIN_TOTAL_SECONDS) {
     const neededShotSeconds =
@@ -109,85 +99,180 @@ function buildVideoFilterGraph(shotImagePaths, shotStyles, tempo) {
   }
 
   const frames = Math.round(shotSeconds * FPS);
+  const totalDurationSeconds = shotCount * shotSeconds - (shotCount - 1) * transitionSeconds;
 
-  const perShotFilters = shotImagePaths.map((_, i) => {
-    const shotStyle = shotStyles[i];
-    const crop = FOCUS_CROPS[shotStyle.focus_bias] ?? null;
-    const cropFilter = crop ? `crop=iw*${crop.w}:ih*${crop.h}:iw*${crop.x}:ih*${crop.y},` : '';
-    const zoom = ZOOM_PARAMS[shotStyle.zoom_intensity] ?? ZOOM_PARAMS.moderate;
-    const colorFilter = COLOR_GRADE_FILTERS[shotStyle.color_grade] ?? COLOR_GRADE_FILTERS.vivid;
-    const motion = MOTION_TYPES.includes(shotStyle.motion) ? shotStyle.motion : 'zoom_in';
-    const vignetteFilter = shotStyle.vignette ? ',vignette' : '';
-    // フィルムグレイン(粒状ノイズ)。ズーム・パンだけでなく質感でも演出にバリエーションを出す。
-    // ffmpeg-staticのバイナリによってはnoiseフィルタが入っていないことがあるため、
-    // 実際に使えるか確認してから使う(無ければ静かにスキップし、動画生成自体は止めない)。
-    const grainFilter = shotStyle.grain && hasFilter('noise') ? ',noise=alls=20:allf=t' : '';
-
-    const basePrefix =
-      `[${i}:v]${cropFilter}scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,` +
-      `crop=${WIDTH}:${HEIGHT},setsar=1,${colorFilter}${vignetteFilter}${grainFilter}`;
-
-    // zoompanのfpsオプションだけでは、ffmpegのビルドによって出力ストリームに
-    // 「一定フレームレート」の情報がうまく伝わらず、後段のxfadeが
-    // "inputs needs to be a constant frame rate; current rate of 1/0 is invalid"
-    // で失敗することがある(ローカルのffmpeg 6.1では問題なかったが、Renderにデプロイした
-    // ffmpeg-staticのLinuxバイナリで発生)。fpsフィルタを明示的に挟んで固定する。
-    const tail = `setpts=PTS-STARTPTS,fps=${FPS}[v${i}]`;
-
-    if (motion === 'static') {
-      // 動きなし。zoompan自体を使わず、同じ画像をそのままframes分並べるだけ。
-      return `${basePrefix},trim=start_frame=0:end_frame=${frames},${tail}`;
-    }
-
-    const pan = motion === 'pan_only' ? (PAN_DRIFT[shotStyle.pan_direction] ?? PAN_DRIFT.none) : PAN_DRIFT[shotStyle.pan_direction] ?? PAN_DRIFT.none;
-    const xExpr = `iw/2-(iw/zoom/2)+${pan.dx}*${PAN_DRIFT_PX}*(on/${frames})`;
-    const yExpr = `ih/2-(ih/zoom/2)+${pan.dy}*${PAN_DRIFT_PX}*(on/${frames})`;
-    const zoomExpr = buildZoomExpr(motion, zoom);
-
-    return (
-      `${basePrefix},` +
-      // zoompanは「1つの入力フレームからd枚の出力フレームを生成し、その間だけzoom値を積み上げる」
-      // 仕組みなので、d=framesにしてショットの全フレームを1回の入力フレームから作らせる必要がある
-      // (d=1だと出力1枚ごとに新しい入力フレーム扱いになりzoomの積み上げが毎回リセットされ、
-      // 見た目上ズームが一切動かないバグになる)。入力側は-loop 1のみで無限に同じ画像を供給できるが、
-      // d=framesにしたことで実際に消費されるのは最初の1フレームだけなので、以前あった
-      // 「d×入力フレーム数の掛け算で動画が63倍に伸びる」問題は起きない。trimは念のための安全弁。
-      `zoompan=z='${zoomExpr}':x='${xExpr}':y='${yExpr}':` +
-      `d=${frames}:s=${WIDTH}x${HEIGHT}:fps=${FPS},` +
-      `trim=start_frame=0:end_frame=${frames},${tail}`
-    );
-  });
-
-  // ハードカット(concat)ではなくxfadeの連鎖で繋ぐ。トランジションの「種類」はショットごとに違っても、
-  // 「長さ」は全ショット共通(transitionSeconds)にしているので、k番目(1始まり)のxfadeのoffsetは
-  // k*(shotSeconds-transitionSeconds)になる(導出: 1本目と2本目を繋いだ時点の尺は2L-T、そこに
-  // 3本目を繋ぐ時のoffsetは(2L-T)-T=2L-2T、以降も同様にk*(L-T)のパターンになる)。
-  const transitionFilters = [];
-  const offsetsSeconds = [];
-  let outputLabel = 'v0';
-  if (shotImagePaths.length === 1) {
-    transitionFilters.push('[v0]null[outv]');
-  } else {
-    for (let i = 1; i < shotImagePaths.length; i += 1) {
-      const offsetSeconds = i * (shotSeconds - transitionSeconds);
-      offsetsSeconds.push(offsetSeconds);
-      const transitionType = shotStyles[i].transition_in ?? 'fade';
-      const nextLabel = i === shotImagePaths.length - 1 ? 'outv' : `vx${i}`;
-      transitionFilters.push(
-        `[${outputLabel}][v${i}]xfade=transition=${transitionType}:duration=${transitionSeconds}:offset=${offsetSeconds}[${nextLabel}]`
-      );
-      outputLabel = nextLabel;
-    }
+  // k番目(1始まり)のxfadeのoffset = k*(shotSeconds - transitionSeconds)。
+  const cutOffsetsSeconds = [];
+  for (let i = 1; i < shotCount; i += 1) {
+    cutOffsetsSeconds.push(i * (shotSeconds - transitionSeconds));
   }
 
-  const totalDurationSeconds =
-    shotImagePaths.length * shotSeconds - (shotImagePaths.length - 1) * transitionSeconds;
+  return { shotSeconds, transitionSeconds, frames, totalDurationSeconds, cutOffsetsSeconds };
+}
 
-  return {
-    filters: [...perShotFilters, ...transitionFilters],
-    cutOffsetsSeconds: offsetsSeconds,
-    totalDurationSeconds,
-  };
+// ─────────────────────────────────────────────────────────────────────────
+// 1ショットぶんの映像フィルタ鎖(ラベル無し = `-vf` にそのまま渡せる形)。
+// クロップ→スケール→色味→ヴィネット→グレイン→zoompan(または静止)→固定fps。
+// ─────────────────────────────────────────────────────────────────────────
+function buildShotVideoFilter(shotStyle, frames) {
+  const crop = FOCUS_CROPS[shotStyle.focus_bias] ?? null;
+  const cropFilter = crop
+    ? `crop=iw*${crop.w}:ih*${crop.h}:iw*${crop.x}:ih*${crop.y},`
+    : '';
+  const zoom = ZOOM_PARAMS[shotStyle.zoom_intensity] ?? ZOOM_PARAMS.moderate;
+  const colorFilter = COLOR_GRADE_FILTERS[shotStyle.color_grade] ?? COLOR_GRADE_FILTERS.vivid;
+  const motion = MOTION_TYPES.includes(shotStyle.motion) ? shotStyle.motion : 'zoom_in';
+  const vignetteFilter = shotStyle.vignette ? ',vignette' : '';
+  // フィルムグレイン。ffmpeg-staticのバイナリによってはnoiseフィルタが無いことがあるため確認してから使う。
+  const grainFilter = shotStyle.grain && hasFilter('noise') ? ',noise=alls=20:allf=t' : '';
+
+  const basePrefix =
+    `${cropFilter}scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,` +
+    `crop=${WIDTH}:${HEIGHT},setsar=1,${colorFilter}${vignetteFilter}${grainFilter}`;
+  // fpsを明示的に固定しておかないと、後段(合成フェーズのxfade)が
+  // "constant frame rate ... invalid" で落ちることがある(Renderのffmpeg-staticで発生)。
+  const tail = `setpts=PTS-STARTPTS,fps=${FPS}`;
+
+  if (motion === 'static') {
+    // 動きなし。zoompanを使わず、同じ画像をframes分並べるだけ。
+    return `${basePrefix},trim=start_frame=0:end_frame=${frames},${tail}`;
+  }
+
+  const pan = PAN_DRIFT[shotStyle.pan_direction] ?? PAN_DRIFT.none;
+  const xExpr = `iw/2-(iw/zoom/2)+${pan.dx}*${PAN_DRIFT_PX}*(on/${frames})`;
+  const yExpr = `ih/2-(ih/zoom/2)+${pan.dy}*${PAN_DRIFT_PX}*(on/${frames})`;
+  const zoomExpr = buildZoomExpr(motion, zoom);
+
+  return (
+    `${basePrefix},` +
+    // zoompanは「1つの入力フレームからd枚の出力フレームを生成し、その間だけzoom値を積み上げる」
+    // 仕組みなので、d=framesにしてショット全体を1回の入力フレームから作らせる。
+    `zoompan=z='${zoomExpr}':x='${xExpr}':y='${yExpr}':` +
+    `d=${frames}:s=${WIDTH}x${HEIGHT}:fps=${FPS},` +
+    `trim=start_frame=0:end_frame=${frames},${tail}`
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// フェーズ2a: 描画済みクリップを xfade で「2本ずつ」逐次的に畳み込む。
+// 1回のffmpegに渡す映像入力は常に2本だけなので、ショット数が増えても
+// メモリはほぼ一定(以前の1パス合成はN本のデコーダ+N-1個のxfadeを1プロセスに
+// 同時展開していて、写真枚数に比例してメモリが増えていた)。
+// 代償は中間クリップの再エンコード(N-1回)。プロトタイプの720pでは許容範囲。
+// ─────────────────────────────────────────────────────────────────────────
+async function mergeClipsProgressive({ clipPaths, shotStyles, timing }) {
+  const { shotSeconds, transitionSeconds } = timing;
+  const temps = [];
+  if (clipPaths.length === 1) {
+    return { mergedPath: clipPaths[0], temps };
+  }
+
+  let accPath = clipPaths[0];
+  // acc(これまで畳み込んだ映像)の理想尺。実ファイルのフレーム丸めではなくこの式で
+  // 進める(xfadeのoffset計算を安定させるため)。
+  let accDurationSeconds = shotSeconds;
+
+  for (let i = 1; i < clipPaths.length; i += 1) {
+    const offsetSeconds = Math.max(0, accDurationSeconds - transitionSeconds);
+    const transitionType = shotStyles[i].transition_in ?? 'fade';
+    const mergedPath = `${clipPaths[0]}.acc${i}.mp4`;
+    temps.push(mergedPath);
+    const inputA = accPath;
+    const inputB = clipPaths[i];
+    // eslint-disable-next-line no-await-in-loop
+    await runFfmpeg((command) => {
+      command
+        .input(inputA)
+        .input(inputB)
+        .complexFilter([
+          `[0:v]fps=${FPS},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[a]`,
+          `[1:v]fps=${FPS},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[b]`,
+          `[a][b]xfade=transition=${transitionType}:` +
+            `duration=${transitionSeconds}:offset=${offsetSeconds}[outv]`,
+        ])
+        .outputOptions([
+          '-map', '[outv]',
+          '-an',
+          '-c:v', 'libx264',
+          '-preset', 'veryfast',
+          '-crf', '20', // 中間クリップは繰り返し再エンコードされるので画質を少し上げておく
+          '-threads', '1',
+          '-pix_fmt', 'yuv420p',
+          '-r', `${FPS}`,
+        ])
+        .save(mergedPath);
+    });
+    accPath = mergedPath;
+    accDurationSeconds += shotSeconds - transitionSeconds;
+  }
+
+  return { mergedPath: accPath, temps };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// フェーズ2b: 畳み込み済みの無音映像に、SEミックスとキャッチコピーを1パスで足す。
+// 映像入力は1本だけ。音声(BGM/ヒット音)のデコードとoverlay1枚は軽い。
+// ─────────────────────────────────────────────────────────────────────────
+async function muxAudioAndCatchphrase({
+  mergedVideoPath,
+  timing,
+  styleResult,
+  showCatchphrase,
+  catchphraseImagePath,
+  catchphraseBoxHeight,
+  outPath,
+}) {
+  const bgPath = resolveSePath(styleResult.music_mood);
+  const hitPath = resolveHitSePath(styleResult.music_mood);
+  // 入力順: [畳み込み映像=0] [キャッチコピー画像?=1] [BGM?] [ヒット音 × カット数]
+  const audioPlan = buildAudioPlan({
+    cutOffsetsSeconds: timing.cutOffsetsSeconds,
+    bgPath,
+    hitPath,
+    videoInputCount: 1 + (showCatchphrase ? 1 : 0),
+    totalDurationSeconds: timing.totalDurationSeconds,
+  });
+
+  const filters = [];
+  let finalVideoLabel = '0:v'; // 既定: 映像はそのままコピー
+  if (showCatchphrase) {
+    const catchphraseY = Math.round(HEIGHT * 0.78) - catchphraseBoxHeight;
+    filters.push('[0:v]null[outv]');
+    filters.push(...buildCatchphraseFilter(1, catchphraseY, timing.totalDurationSeconds));
+    finalVideoLabel = '[outv_text]';
+  }
+  if (audioPlan) {
+    filters.push(...audioPlan.filters);
+  }
+
+  await runFfmpeg((command) => {
+    command.input(mergedVideoPath);
+    if (showCatchphrase) {
+      command.input(catchphraseImagePath).inputOptions(['-loop 1', `-framerate ${FPS}`]);
+    }
+    if (audioPlan) {
+      audioPlan.extraInputs.forEach(({ path: inputPath, loop }) => {
+        const input = command.input(inputPath);
+        if (loop) input.inputOptions(['-stream_loop', '-1']);
+      });
+    }
+    if (filters.length > 0) {
+      command.complexFilter(filters);
+    }
+    command
+      .outputOptions([
+        '-map', finalVideoLabel,
+        ...(audioPlan ? ['-map', '[outa]'] : []),
+        // キャッチコピーを焼き込むときだけ再エンコード。無ければ映像はコピーで無劣化。
+        '-c:v', showCatchphrase ? 'libx264' : 'copy',
+        ...(showCatchphrase
+          ? ['-preset', 'veryfast', '-crf', '20', '-threads', '1', '-pix_fmt', 'yuv420p']
+          : []),
+        '-movflags', '+faststart',
+        ...(audioPlan ? ['-shortest', '-c:a', 'aac'] : []),
+      ])
+      .save(outPath);
+  });
 }
 
 // 各カットの切り替えタイミングに合わせて短い「衝撃音」を鳴らし、あれば背景SE(bgPath)ともミックスする。
@@ -201,10 +286,8 @@ function buildAudioPlan({ cutOffsetsSeconds, bgPath, hitPath, videoInputCount, t
   if (bgPath) {
     const idx = nextInputIndex;
     nextInputIndex += 1;
-    // BGM素材は数秒の短いループ素材なので、動画の尺いっぱいに-stream_loop -1で無限リピート
-    // させて入力する(見た目のループ処理としてzoompan等で使っている-loop 1の音声版)。
-    // 無限入力のままだと際限なく伸びる(過去に同じ理由でzoompan/apadがハングした)ため、
-    // atrimで動画の総尺ちょうどに切り詰める。
+    // BGM素材は数秒の短いループ素材なので -stream_loop -1 で無限リピート入力し、
+    // atrimで動画の総尺ちょうどに切り詰める(無限入力のままだと際限なく伸びる)。
     extraInputs.push({ path: bgPath, loop: true });
     filters.push(
       `[${idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,` +
@@ -231,11 +314,9 @@ function buildAudioPlan({ cutOffsetsSeconds, bgPath, hitPath, videoInputCount, t
     return null;
   }
 
-  // ヒット音だけ(=短い断続音のみ)だと音声トラックが動画よりずっと短くなり、
-  // 後段の-shortestが動画側を音声の短さに合わせて切り詰めてしまう。apad(whole_dur指定)で
-  // 動画と同じ長さまで無音パディングする。whole_durを指定せず素の`apad`だけにすると
-  // 際限なく無音を生成しようとしてフィルタ処理がハングし、"No space left on device"のような
-  // 異常終了を引き起こしたため、必ず秒数を明示する。
+  // ヒット音だけだと音声トラックが動画よりずっと短くなり、後段の-shortestが動画側を
+  // 切り詰めてしまう。apad(whole_dur指定)で動画と同じ長さまで無音パディングする
+  // (whole_durを省くと際限なく無音を生成しようとしてハングする)。
   filters.push(
     `${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest,` +
       `apad=whole_dur=${totalDurationSeconds}[outa]`
@@ -244,19 +325,14 @@ function buildAudioPlan({ cutOffsetsSeconds, bgPath, hitPath, videoInputCount, t
 }
 
 // 動画冒頭に短いキャッチコピーを重ねる(AIが「似合う」と判断した場合のみ)。
-// FFmpegの`drawtext`(freetype同梱ビルドが必要)がRenderのffmpeg-staticバイナリに
-// 入っておらず使えなかったため、テキストはrenderCatchphrase.js側でsharpにより
-// 透過PNG画像として事前に描画し、ここではその画像をほぼ全ビルドに入っている
-// 基本機能`overlay`で動画に重ねるだけにする(drawtext不要)。
-// fadeフィルタのalpha=1オプションで、画像そのものではなくアルファチャンネルを
-// フェードさせ、下の映像を透かしながら滑らかに現れて消えるようにしている。
+// drawtext(freetype同梱ビルドが必要)がRenderのffmpeg-staticに無いため、テキストは
+// renderCatchphrase.js側でsharpにより透過PNGとして描画し、ここではoverlayで重ねるだけ。
 function buildCatchphraseFilter(imageInputIndex, catchphraseY, totalDurationSeconds) {
   const fadeInEnd = 0.4;
   const holdEnd = 2.6;
   const fadeOutStart = holdEnd;
   const fadeOutDuration = 0.4;
-  // キャッチコピー画像の入力は-loop 1で無限に供給されるため、trimで明示的に動画全体の
-  // 長さへ切らないと(zoompanで一度踏んだのと同じ理由で)出力が際限なく伸びてしまう。
+  // キャッチコピー画像の入力は -loop 1 で無限供給されるため、trimで動画全体の長さへ切る。
   const totalFrames = Math.round(totalDurationSeconds * FPS);
 
   return [
@@ -264,7 +340,8 @@ function buildCatchphraseFilter(imageInputIndex, catchphraseY, totalDurationSeco
       `fade=t=in:st=0:d=${fadeInEnd}:alpha=1,` +
       `fade=t=out:st=${fadeOutStart}:d=${fadeOutDuration}:alpha=1,` +
       `trim=start_frame=0:end_frame=${totalFrames},setpts=PTS-STARTPTS[textlayer]`,
-    `[outv][textlayer]overlay=x=0:y=${catchphraseY}:enable='between(t,0,${fadeOutStart + fadeOutDuration})'[outv_text]`,
+    `[outv][textlayer]overlay=x=0:y=${catchphraseY}:` +
+      `enable='between(t,0,${fadeOutStart + fadeOutDuration})'[outv_text]`,
   ];
 }
 
@@ -273,10 +350,48 @@ function resolveSePath(musicMood) {
   return existsSync(candidatePath) ? candidatePath : null;
 }
 
-// 予告編風の可変ショット数パイプライン: 写真→ショットごとのクロップ・ズーム・パン・色味・ヴィネット→
-// ショットごとに違うトランジションで連結→SEミックス→mp4。styleResult(selectStyle.jsがAIまたは
-// デフォルトで決める)に従って、ショットごとの演出とテンポ・SEを切り替える。実際の描画処理
-// (力仕事)はすべてFFmpeg側が担う。
+// fluent-ffmpegの1コマンドをPromiseで実行する小さなラッパ。
+function runFfmpeg(configure) {
+  return new Promise((resolve, reject) => {
+    const command = ffmpeg();
+    configure(command);
+    command
+      .on('start', (cmd) => console.log('[ffmpeg]', cmd))
+      .on('stderr', (line) => console.log('[ffmpeg]', line))
+      .on('error', (err) => reject(err))
+      .on('end', () => resolve());
+  });
+}
+
+// フェーズ1: 1ショットを単独のffmpegで描画し、CFRなmp4クリップとして書き出す。
+// 同時に存在するzoompanは常に1つだけなので、ショット数を増やしてもメモリはほぼ一定。
+async function renderShotClip({ imagePath, videoFilter, frames, clipPath }) {
+  await runFfmpeg((command) => {
+    command
+      .input(imagePath)
+      .inputOptions(['-loop 1', `-framerate ${FPS}`])
+      .videoFilters(videoFilter)
+      .outputOptions([
+        '-an',
+        // trim(end_frame=frames)と同じ枚数で頭打ちにして、クリップ長を元実装と一致させる。
+        '-frames:v', `${frames}`,
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-threads', '1',
+        '-pix_fmt', 'yuv420p',
+        '-r', `${FPS}`,
+      ])
+      .save(clipPath);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 予告編風の可変ショット数パイプライン(2フェーズ)。
+//   フェーズ1: 写真ごとに個別のffmpegでショットクリップを描画(zoompan等の力仕事はここ、1本ずつ)
+//   フェーズ2: 描画済みクリップをxfade連鎖 + SEミックス + キャッチコピーで1本に合成(軽い)
+// 以前は全部を1つの巨大な filter_complex に入れていたため、写真枚数に比例して
+// メモリが増え、Renderの512MBプランで5枚以上がOOM Kill(exit 137)されていた。
+// ─────────────────────────────────────────────────────────────────────────
 export async function generateVideo({ shotImagePaths, outPath, styleResult }) {
   if (!shotImagePaths || shotImagePaths.length === 0) {
     throw new Error('shotImagePaths is empty');
@@ -285,17 +400,14 @@ export async function generateVideo({ shotImagePaths, outPath, styleResult }) {
     throw new Error('styleResult.shots must match shotImagePaths length');
   }
 
-  const { filters: videoFilters, cutOffsetsSeconds, totalDurationSeconds } = buildVideoFilterGraph(
-    shotImagePaths,
-    styleResult.shots,
-    styleResult.tempo
-  );
+  const shotStyles = styleResult.shots;
+  const timing = computeTiming(shotImagePaths.length, styleResult.tempo);
 
-  // キャッチコピーはAIが「似合う」と判断したときだけ(catchphrase_shown)重ねる。
-  // overlayはほぼ全てのffmpegビルドに入っている基本機能だが、念のため確認してから使う
-  // (無ければ静かにスキップし、動画生成自体は止めない)。
+  // キャッチコピーはAIが「似合う」と判断したときだけ重ねる。
   const catchphraseText = styleResult.catchphrase_text?.trim();
-  const showCatchphrase = Boolean(styleResult.catchphrase_shown && catchphraseText && hasFilter('overlay'));
+  const showCatchphrase = Boolean(
+    styleResult.catchphrase_shown && catchphraseText && hasFilter('overlay')
+  );
   const catchphraseImagePath = showCatchphrase ? `${outPath}.catchphrase.png` : null;
   let catchphraseBoxHeight = 0;
   if (catchphraseImagePath) {
@@ -306,77 +418,56 @@ export async function generateVideo({ shotImagePaths, outPath, styleResult }) {
     }));
   }
 
-  // キャッチコピー画像を入れる場合、ショット画像の直後・音声入力の直前に1本追加で
-  // ffmpegの入力に足すことになるため、音声側のinputインデックス計算をずらす必要がある。
-  const catchphraseInputIndex = shotImagePaths.length;
-  const bgPath = resolveSePath(styleResult.music_mood);
-  const hitPath = resolveHitSePath(styleResult.music_mood);
-  const audioPlan = buildAudioPlan({
-    cutOffsetsSeconds,
-    bgPath,
-    hitPath,
-    videoInputCount: shotImagePaths.length + (showCatchphrase ? 1 : 0),
-    totalDurationSeconds,
-  });
-
-  const allFilters = audioPlan ? [...videoFilters, ...audioPlan.filters] : [...videoFilters];
-  if (showCatchphrase) {
-    const catchphraseY = Math.round(HEIGHT * 0.78) - catchphraseBoxHeight;
-    allFilters.push(...buildCatchphraseFilter(catchphraseInputIndex, catchphraseY, totalDurationSeconds));
-  }
-  const finalVideoLabel = showCatchphrase ? '[outv_text]' : '[outv]';
+  const clipPaths = shotImagePaths.map((_, i) => `${outPath}.shot${i}.mp4`);
+  const tempFiles = [...clipPaths, catchphraseImagePath].filter(Boolean);
 
   const cleanup = () => {
-    if (catchphraseImagePath && existsSync(catchphraseImagePath)) {
-      unlinkSync(catchphraseImagePath);
+    for (const p of tempFiles) {
+      if (p && p !== outPath && existsSync(p)) {
+        try {
+          unlinkSync(p);
+        } catch {
+          // 一時ファイルの後始末なので失敗しても無視
+        }
+      }
     }
   };
 
-  return new Promise((resolve, reject) => {
-    const command = ffmpeg();
-
-    shotImagePaths.forEach((imagePath) => {
-      // -tは付けない(無限ループの静止画入力にして、フィルタ側のtrimで長さを確定する)
-      command.input(imagePath).inputOptions(['-loop 1', `-framerate ${FPS}`]);
-    });
-
-    if (showCatchphrase) {
-      command.input(catchphraseImagePath).inputOptions(['-loop 1', `-framerate ${FPS}`]);
-    }
-
-    if (audioPlan) {
-      audioPlan.extraInputs.forEach(({ path: inputPath, loop }) => {
-        const input = command.input(inputPath);
-        if (loop) input.inputOptions(['-stream_loop', '-1']);
+  try {
+    // ── フェーズ1: ショットクリップを1本ずつ描画(zoompanは常に1つだけ) ──
+    for (let i = 0; i < shotImagePaths.length; i += 1) {
+      const videoFilter = buildShotVideoFilter(shotStyles[i], timing.frames);
+      // 直列実行が肝(並列化するとzoompanが複数同時に走りメモリ一定の保証が崩れる)。
+      // eslint-disable-next-line no-await-in-loop
+      await renderShotClip({
+        imagePath: shotImagePaths[i],
+        videoFilter,
+        frames: timing.frames,
+        clipPath: clipPaths[i],
       });
     }
 
-    const outputOptions = [
-      '-map', finalVideoLabel,
-      ...(audioPlan ? ['-map', '[outa]'] : []),
-      '-c:v', 'libx264',
-      // Renderの無料プラン(RAM 512MB)向けにメモリ・CPU負荷を下げる設定
-      '-preset', 'veryfast',
-      '-threads', '1',
-      '-pix_fmt', 'yuv420p',
-      // moovアトムを先頭に置き、ブラウザでのプログレッシブ再生を可能にする
-      '-movflags', '+faststart',
-      ...(audioPlan ? ['-shortest', '-c:a', 'aac'] : []),
-    ];
+    // ── フェーズ2a: クリップを2本ずつxfadeで畳み込む(映像入力は常に2本だけ) ──
+    const { mergedPath, temps: mergeTemps } = await mergeClipsProgressive({
+      clipPaths,
+      shotStyles,
+      timing,
+    });
+    tempFiles.push(...mergeTemps);
 
-    command
-      .complexFilter(allFilters)
-      .outputOptions(outputOptions)
-      .on('start', (cmd) => console.log('[ffmpeg]', cmd))
-      .on('stderr', (line) => console.log('[ffmpeg]', line))
-      .on('error', (err) => {
-        cleanup();
-        reject(err);
-      })
-      .on('end', () => {
-        cleanup();
-        resolve(outPath);
-      })
-      .save(outPath);
-  });
+    // ── フェーズ2b: 無音映像にSEミックスとキャッチコピーを足して仕上げる ──
+    await muxAudioAndCatchphrase({
+      mergedVideoPath: mergedPath,
+      timing,
+      styleResult,
+      showCatchphrase,
+      catchphraseImagePath,
+      catchphraseBoxHeight,
+      outPath,
+    });
+
+    return outPath;
+  } finally {
+    cleanup();
+  }
 }
