@@ -92,10 +92,16 @@ function computeTiming(shotCount, tempo) {
 
   const rawTotalSeconds = shotCount * shotSeconds - (shotCount - 1) * transitionSeconds;
   if (rawTotalSeconds < TARGET_MIN_TOTAL_SECONDS) {
+    // transitionSeconds を先に確定してから neededShotSeconds を計算する。
+    // 逆順(旧実装のバグ)だと、shotSeconds は「引き上げ前の短いtransition」を
+    // 前提に計算されるのに、直後でtransitionを伸ばしてしまうため、実際の
+    // totalDurationSeconds が TARGET_MIN_TOTAL_SECONDS より短くなっていた
+    // (例: 写真3枚→4ショットで 15.0s のはずが 14.7s にしかならない)。
+    // 2026-09-04 検証で発覚(FB「3枚だと短い」への対応のはずが未達だった)。
+    transitionSeconds = Math.max(transitionSeconds, TRANSITION_SECONDS.slow);
     const neededShotSeconds =
       (TARGET_MIN_TOTAL_SECONDS + (shotCount - 1) * transitionSeconds) / shotCount;
     shotSeconds = Math.min(MAX_SHOT_SECONDS, Math.max(shotSeconds, neededShotSeconds));
-    transitionSeconds = Math.max(transitionSeconds, TRANSITION_SECONDS.slow);
   }
 
   const frames = Math.round(shotSeconds * FPS);
