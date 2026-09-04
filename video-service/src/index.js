@@ -26,6 +26,7 @@ app.use(cors());
 app.use('/output', express.static(OUTPUT_DIR));
 
 const upload = multer({ dest: UPLOAD_DIR });
+const jobs = new Map();
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
@@ -52,6 +53,51 @@ app.post('/generate', upload.array('photos', 20), async (req, res) => {
     console.error(err);
     res.status(500).json({ error: '動画生成に失敗しました', detail: String(err) });
   }
+});
+
+// Woolink uses a short request + polling flow so mobile browsers do not keep
+// one HTTP connection open during the full AI/FFmpeg generation.
+app.post('/generate-async', upload.array('photos', 20), (req, res) => {
+  if (!req.files || req.files.length === 0) {
+    res.status(400).json({ error: '写真が1枚も届いていません(multipart/form-dataの photos フィールドで送ってください)' });
+    return;
+  }
+
+  const jobId = randomUUID();
+  const outPath = path.join(OUTPUT_DIR, `${jobId}.mp4`);
+  const photoPaths = req.files.map((f) => f.path);
+  jobs.set(jobId, { status: 'processing' });
+  res.status(202).json({ jobId, status: 'processing' });
+
+  void (async () => {
+    try {
+      await resizePhotosInPlace(photoPaths);
+      const shotImagePaths = resolveShotImagePaths(photoPaths);
+      const styleResult = await selectStyle(shotImagePaths);
+      await generateVideo({ shotImagePaths, outPath, styleResult });
+      jobs.set(jobId, {
+        status: 'completed',
+        videoUrl: `/output/${jobId}.mp4`,
+        style: styleResult,
+      });
+    } catch (err) {
+      console.error(`[job:${jobId}]`, err);
+      jobs.set(jobId, {
+        status: 'failed',
+        error: '動画生成に失敗しました',
+        detail: String(err),
+      });
+    }
+  })();
+});
+
+app.get('/jobs/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) {
+    res.status(404).json({ error: '生成ジョブが見つかりません' });
+    return;
+  }
+  res.json({ jobId: req.params.jobId, ...job });
 });
 
 const PORT = process.env.PORT || 4000;
