@@ -195,8 +195,10 @@ async function mergeClipsProgressive({ clipPaths, shotStyles, timing }) {
         .input(inputA)
         .input(inputB)
         .complexFilter([
-          `[0:v]fps=${FPS},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[a]`,
-          `[1:v]fps=${FPS},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[b]`,
+          // ffmpeg-static 7.x on Render can expose MP4 inputs to xfade with a 1/0
+          // time base. Normalize it explicitly so xfade sees a valid CFR stream.
+          `[0:v]fps=${FPS},settb=AVTB,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[a]`,
+          `[1:v]fps=${FPS},settb=AVTB,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[b]`,
           `[a][b]xfade=transition=${transitionType}:` +
             `duration=${transitionSeconds}:offset=${offsetSeconds}[outv]`,
         ])
