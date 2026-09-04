@@ -13,6 +13,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SE_DIR = path.join(__dirname, '..', '..', 'assets', 'se');
 
 const FPS = 25;
+const DISABLE_XFADE = process.env.DISABLE_XFADE === 'true';
 // Renderの無料プラン(RAM 512MB)向けに 1080x1920 から落としてある。
 // 根本対応(ショットを1本ずつ描画)後は解像度を戻す余地があるが、合成フェーズで
 // クリップ本数ぶんのH.264デコーダを同時に開くため、まずは安全側の720pのままにする。
@@ -189,19 +190,26 @@ async function mergeClipsProgressive({ clipPaths, shotStyles, timing }) {
     temps.push(mergedPath);
     const inputA = accPath;
     const inputB = clipPaths[i];
+    const mergeFilters = DISABLE_XFADE
+      ? [
+          `[0:v]fps=${FPS},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[a]`,
+          `[1:v]fps=${FPS},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[b]`,
+          '[a][b]concat=n=2:v=1:a=0[outv]',
+        ]
+      : [
+          // ffmpeg-static 7.x can expose MP4 inputs to xfade with an invalid
+          // time base. Normalize it explicitly before applying transitions.
+          `[0:v]fps=${FPS},settb=AVTB,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[a]`,
+          `[1:v]fps=${FPS},settb=AVTB,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[b]`,
+          `[a][b]xfade=transition=${transitionType}:` +
+            `duration=${transitionSeconds}:offset=${offsetSeconds}[outv]`,
+        ];
     // eslint-disable-next-line no-await-in-loop
     await runFfmpeg((command) => {
       command
         .input(inputA)
         .input(inputB)
-        .complexFilter([
-          // ffmpeg-static 7.x on Render can expose MP4 inputs to xfade with a 1/0
-          // time base. Normalize it explicitly so xfade sees a valid CFR stream.
-          `[0:v]fps=${FPS},settb=AVTB,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[a]`,
-          `[1:v]fps=${FPS},settb=AVTB,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[b]`,
-          `[a][b]xfade=transition=${transitionType}:` +
-            `duration=${transitionSeconds}:offset=${offsetSeconds}[outv]`,
-        ])
+        .complexFilter(mergeFilters)
         .outputOptions([
           '-map', '[outv]',
           '-an',
