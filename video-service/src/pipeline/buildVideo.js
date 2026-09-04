@@ -1,6 +1,6 @@
 import ffmpegPath from 'ffmpeg-static';
 import ffmpeg from 'fluent-ffmpeg';
-import { existsSync, unlinkSync } from 'node:fs';
+import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveHitSePath } from './ensureSe.js';
@@ -178,6 +178,25 @@ async function mergeClipsProgressive({ clipPaths, shotStyles, timing }) {
     return { mergedPath: clipPaths[0], temps };
   }
 
+  // Render's free instance is too slow for repeatedly re-encoding an
+  // ever-growing accumulator. All shot clips share the same H.264 settings,
+  // so its compatibility mode can concatenate them losslessly in one pass.
+  if (DISABLE_XFADE) {
+    const listPath = `${clipPaths[0]}.concat.txt`;
+    const mergedPath = `${clipPaths[0]}.concat.mp4`;
+    const lines = clipPaths.map((clipPath) => `file '${clipPath.replaceAll("'", "'\\''")}'`);
+    writeFileSync(listPath, `${lines.join('\n')}\n`, 'utf8');
+    temps.push(listPath, mergedPath);
+    await runFfmpeg((command) => {
+      command
+        .input(listPath)
+        .inputOptions(['-f', 'concat', '-safe', '0'])
+        .outputOptions(['-an', '-c:v', 'copy'])
+        .save(mergedPath);
+    });
+    return { mergedPath, temps };
+  }
+
   let accPath = clipPaths[0];
   // acc(これまで畳み込んだ映像)の理想尺。実ファイルのフレーム丸めではなくこの式で
   // 進める(xfadeのoffset計算を安定させるため)。
@@ -190,20 +209,14 @@ async function mergeClipsProgressive({ clipPaths, shotStyles, timing }) {
     temps.push(mergedPath);
     const inputA = accPath;
     const inputB = clipPaths[i];
-    const mergeFilters = DISABLE_XFADE
-      ? [
-          `[0:v]fps=${FPS},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[a]`,
-          `[1:v]fps=${FPS},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[b]`,
-          '[a][b]concat=n=2:v=1:a=0[outv]',
-        ]
-      : [
-          // ffmpeg-static 7.x can expose MP4 inputs to xfade with an invalid
-          // time base. Normalize it explicitly before applying transitions.
-          `[0:v]fps=${FPS},settb=AVTB,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[a]`,
-          `[1:v]fps=${FPS},settb=AVTB,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[b]`,
-          `[a][b]xfade=transition=${transitionType}:` +
-            `duration=${transitionSeconds}:offset=${offsetSeconds}[outv]`,
-        ];
+    const mergeFilters = [
+      // ffmpeg-static 7.x can expose MP4 inputs to xfade with an invalid
+      // time base. Normalize it explicitly before applying transitions.
+      `[0:v]fps=${FPS},settb=AVTB,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[a]`,
+      `[1:v]fps=${FPS},settb=AVTB,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[b]`,
+      `[a][b]xfade=transition=${transitionType}:` +
+        `duration=${transitionSeconds}:offset=${offsetSeconds}[outv]`,
+    ];
     // eslint-disable-next-line no-await-in-loop
     await runFfmpeg((command) => {
       command
